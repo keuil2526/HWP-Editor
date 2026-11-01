@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=HWP 편집기
+Name[en]=HWP Editor
+GenericName=문서 편집기
+GenericName[en]=Document Editor
+Comment=한글 문서(HWP·HWPX)를 열고 편집합니다
+Comment[en]=Open and edit Hangul (HWP/HWPX) documents
+Exec=hwpedit %F
+Icon=io.github.hwpedit.HwpEdit
+Terminal=false
+Categories=Office;WordProcessor;GTK;
+MimeType=application/x-hwp;application/vnd.hancom.hwp;application/haansofthwp;application/hwp+zip;application/vnd.hancom.hwpx;application/haansofthwpx;
+Keywords=hwp;hwpx;hangul;한글;문서;
+StartupNotify=true
+StartupWMClass=io.github.hwpedit.HwpEdit

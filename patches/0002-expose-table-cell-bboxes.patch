@@ -1,0 +1,14 @@
+diff --git a/src/document_core/commands/object_ops/table.rs b/src/document_core/commands/object_ops/table.rs
+index 3413ce73..1004681e 100644
+--- a/src/document_core/commands/object_ops/table.rs
++++ b/src/document_core/commands/object_ops/table.rs
+@@ -1194,7 +1194,8 @@ impl DocumentCore {
+     }
+     /// page_hint부터 탐색하여 표의 셀 bbox를 반환한다 (네이티브).
+     /// page_hint에서 못 찾으면 앞쪽도 탐색한다 (페이지 분할된 표 대응).
+-    pub(crate) fn get_table_cell_bboxes_from_page(
++    /// [hwpedit] public so an editor UI can find cell borders for mouse resizing.
++    pub fn get_table_cell_bboxes_from_page(
+         &self,
+         section_idx: usize,
+         parent_para_idx: usize,

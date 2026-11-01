@@ -1,0 +1,15 @@
+[package]
+name = "hwpedit"
+description = "Linux HWP/HWPX editor (GTK4/libadwaita)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hwpedit-core = { path = "../core" }
+hwpedit-engine = { path = "../engine" }
+gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_6"] }
+resvg = "0.45"
+# memmap: share face data instead of re-reading font files on every text lookup
+fontdb = { version = "0.23", features = ["memmap"] }

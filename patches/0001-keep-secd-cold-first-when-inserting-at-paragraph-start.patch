@@ -1,0 +1,33 @@
+diff --git a/src/model/paragraph.rs b/src/model/paragraph.rs
+index 601e696c..e7526c70 100644
+--- a/src/model/paragraph.rs
++++ b/src/model/paragraph.rs
+@@ -1143,7 +1143,27 @@ impl Paragraph {
+             last_char_end + trailing_ctrl_count * 8
+         } else if inserts_before_inline_control {
+             if effective_char_offset == 0 {
+-                0
++                // [hwpedit] Insert right before the first inline control at text
++                // position 0, not at raw 0: leading secd/cold must stay first, or
++                // Hancom ignores the section definition (page size/orientation).
++                // Controls before it are all at text position 0, 8 units each.
++                self.controls
++                    .iter()
++                    .zip(control_positions.iter())
++                    .position(|(ctrl, &pos)| {
++                        pos == 0
++                            && matches!(
++                                ctrl,
++                                Control::Shape(_)
++                                    | Control::Table(_)
++                                    | Control::Picture(_)
++                                    | Control::Equation(_)
++                                    | Control::Footnote(_)
++                                    | Control::Endnote(_)
++                                    | Control::AutoNumber(_)
++                            )
++                    })
++                    .map_or(0, |i| i as u32 * 8)
+             } else if !self.char_offsets.is_empty() {
+                 let prev_idx = effective_char_offset - 1;
+                 self.char_offsets[prev_idx] + Self::char_stream_len(text_chars[prev_idx])

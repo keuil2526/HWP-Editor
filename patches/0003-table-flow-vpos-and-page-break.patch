@@ -1,0 +1,173 @@
+diff --git a/src/document_core/commands/object_ops/table.rs b/src/document_core/commands/object_ops/table.rs
+index 1004681e..63ba48e0 100644
+--- a/src/document_core/commands/object_ops/table.rs
++++ b/src/document_core/commands/object_ops/table.rs
+@@ -587,13 +587,13 @@ impl DocumentCore {
+             zones: Vec::new(),
+             cells,
+             cell_grid: Vec::new(),
+-            page_break: if options.repeat_header.is_some() {
+-                // HWPX CELL은 저장소 공통 IR의 RowBreak에 대응한다.
+-                TablePageBreak::RowBreak
+-            } else {
+-                TablePageBreak::None
+-            },
+-            repeat_header: options.repeat_header.unwrap_or(false),
++            // [hwpedit] 한컴 새 표의 기본값은 쪽 경계에서 나눔 + 제목 줄 반복이다
++            // (한컴 저장본 표 attr=0x...06, HWPX pageBreak="CELL" repeatHeader="1").
++            // 아래 raw_table_record_attr 의 기본 0x6 과 모델 값을 일치시킨다 — 모델이 None 이면
++            // 긴 표가 나뉘지 않고 통째로 다음 쪽으로 넘어간다.
++            // HWPX CELL은 저장소 공통 IR의 RowBreak에 대응한다.
++            page_break: TablePageBreak::RowBreak,
++            repeat_header: options.repeat_header.unwrap_or(true),
+             caption: None,
+             common: crate::model::shape::CommonObjAttr {
+                 instance_id,
+diff --git a/src/document_core/commands/table_ops.rs b/src/document_core/commands/table_ops.rs
+index 7c31daa4..d8780948 100644
+--- a/src/document_core/commands/table_ops.rs
++++ b/src/document_core/commands/table_ops.rs
+@@ -3645,6 +3645,75 @@ impl DocumentCore {
+         ))
+     }
+ 
++    /// [hwpedit] 편집으로 크기가 바뀐 자리차지 표의 저장 높이와 뒤따르는 문단의 vpos 를 맞춘다.
++    ///
++    /// 셀 입력·줄 추가처럼 표 높이가 바뀌는 편집은 표 아래 문단의 저장 vpos 를 다시 잇지
++    /// 않아, 다음 표가 앞 표 위에 저장된다. 한컴 저장본처럼 표 높이(`common.height`)를
++    /// 측정 높이로 갱신하고 host 문단부터 vpos 를 다시 잇는다. 편집한 표 하나만 다루므로
++    /// 손대지 않은 표의 저장값은 바뀌지 않는다. 바뀐 것이 있으면 true.
++    pub fn sync_table_flow_native(
++        &mut self,
++        section_idx: usize,
++        parent_para_idx: usize,
++        control_idx: usize,
++    ) -> Result<bool, HwpError> {
++        use crate::model::shape::{TextWrap, VertRelTo};
++        self.paginate_if_needed();
++        let measured_hu = self
++            .measured_tables
++            .get(section_idx)
++            .and_then(|tables| {
++                tables
++                    .iter()
++                    .find(|m| m.para_index == parent_para_idx && m.control_index == control_idx)
++            })
++            .map(|m| crate::renderer::px_to_hwpunit(m.total_height - m.caption_height, self.dpi));
++        let para = self
++            .document
++            .sections
++            .get_mut(section_idx)
++            .and_then(|s| s.paragraphs.get_mut(parent_para_idx))
++            .ok_or_else(|| HwpError::RenderError("표 문단을 찾을 수 없습니다".to_string()))?;
++        let Some(Control::Table(table)) = para.controls.get_mut(control_idx) else {
++            return Err(HwpError::RenderError("표를 찾을 수 없습니다".to_string()));
++        };
++        if table.common.treat_as_char
++            || table.common.text_wrap != TextWrap::TopAndBottom
++            || table.common.vert_rel_to != VertRelTo::Para
++        {
++            return Ok(false);
++        }
++        let mut changed = false;
++        if let Some(h) = measured_hu.filter(|&h| h > 0 && h as u32 != table.common.height) {
++            table.sync_ctrl_height(h as u32);
++            changed = true;
++        }
++        let before: Vec<i32> = self.document.sections[section_idx].paragraphs[parent_para_idx..]
++            .iter()
++            .map(|p| p.line_segs.first().map_or(0, |ls| ls.vertical_pos))
++            .collect();
++        let doc_hwp3_layout = self.document.layout_profile().hwp3_layout();
++        crate::renderer::composer::recalculate_section_vpos(
++            &mut self.document.sections[section_idx].paragraphs,
++            parent_para_idx,
++            Some(parent_para_idx..parent_para_idx + 1),
++            None,
++            &self.styles,
++            self.dpi,
++            doc_hwp3_layout,
++        );
++        let moved = self.document.sections[section_idx].paragraphs[parent_para_idx..]
++            .iter()
++            .zip(&before)
++            .any(|(p, &b)| p.line_segs.first().map_or(0, |ls| ls.vertical_pos) != b);
++        if changed || moved {
++            self.document.sections[section_idx].raw_stream = None;
++            self.recompose_section(section_idx);
++            self.paginate_if_needed();
++        }
++        Ok(changed || moved)
++    }
++
+     /// 표의 칸 크기를 한 걸음 바꾼다 — 웹한글컨트롤 `Run("TableResize*")` 계열 열둘.
+     ///
+     /// 한글 저장본의 앞뒤 두 벌을 견줘 실측했다(`probes/pT-*.json`, 계획서 §4.21). 어느 API 도
+diff --git a/src/renderer/composer/line_breaking.rs b/src/renderer/composer/line_breaking.rs
+index 1c2b7cdc..87864a2b 100755
+--- a/src/renderer/composer/line_breaking.rs
++++ b/src/renderer/composer/line_breaking.rs
+@@ -4873,9 +4873,12 @@ pub(crate) fn recalculate_section_vpos(
+         height.saturating_add(ls.line_spacing)
+     };
+     let seg_end = |p: &Paragraph| -> Option<i32> {
+-        p.line_segs
++        let line_end = p
++            .line_segs
+             .last()
+-            .map(|ls| ls.vertical_pos.saturating_add(seg_advance(ls)))
++            .map(|ls| ls.vertical_pos.saturating_add(seg_advance(ls)));
++        // [hwpedit] 자리차지 표 host 문단은 표 아래에서 끝난다 (한컴 저장 관례).
++        line_end.map(|end| host_table_flow_end(p).map_or(end, |t| end.max(t)))
+     };
+     let is_ignored = |pi: usize| {
+         ignore_reset_range
+@@ -4976,7 +4979,7 @@ pub(crate) fn recalculate_section_vpos(
+ /// `start_stored_end` 로 전달하기 위한 헬퍼 — reflow 가 end 를 덮은 뒤에는 저장
+ /// 좌표를 복원할 수 없다.
+ pub(crate) fn paragraph_flow_end(para: &Paragraph) -> Option<i32> {
+-    para.line_segs.last().map(|ls| {
++    let line_end = para.line_segs.last().map(|ls| {
+         let height = if ls.line_height > ls.text_height && ls.text_height > 0 {
+             ls.text_height
+         } else {
+@@ -4984,7 +4987,38 @@ pub(crate) fn paragraph_flow_end(para: &Paragraph) -> Option<i32> {
+         };
+         ls.vertical_pos
+             .saturating_add(height.saturating_add(ls.line_spacing))
+-    })
++    });
++    line_end.map(|end| host_table_flow_end(para).map_or(end, |t| end.max(t)))
++}
++
++/// [hwpedit] 문단이 품은 자리차지 표(비-TAC, 위아래 배치, 세로 기준=문단)의 흐름 end.
++///
++/// 한컴은 이런 표 host 문단의 LINE_SEG 를 글자 한 줄(lh=1000)로 저장하지만, 다음 문단의
++/// vpos 는 `host vpos + 세로 오프셋 + 표 높이 + 바깥 여백 위·아래` 에 둔다
++/// (rhwp `samples/tb-img-03.hwp`: host vpos 0, 표 18216 + 283 + 283 → 다음 문단 vpos 18782).
++/// 줄 높이만으로 흐름을 이으면 표 아래 문단과 그 다음 표가 앞 표 위에 저장되어 겹친다.
++pub(crate) fn host_table_flow_end(para: &Paragraph) -> Option<i32> {
++    use crate::model::shape::{TextWrap, VertRelTo};
++    let first = para.line_segs.first()?.vertical_pos;
++    para.controls
++        .iter()
++        .filter_map(|ctrl| match ctrl {
++            Control::Table(t)
++                if !t.common.treat_as_char
++                    && t.common.text_wrap == TextWrap::TopAndBottom
++                    && t.common.vert_rel_to == VertRelTo::Para =>
++            {
++                Some(
++                    first
++                        .saturating_add(t.common.vertical_offset as i32)
++                        .saturating_add(t.common.height as i32)
++                        .saturating_add(i32::from(t.outer_margin_top))
++                        .saturating_add(i32::from(t.outer_margin_bottom)),
++                )
++            }
++            _ => None,
++        })
++        .max()
+ }
+ 
+ /// font_size(px)를 LineSeg의 line_height(HWPUNIT)로 변환한다.

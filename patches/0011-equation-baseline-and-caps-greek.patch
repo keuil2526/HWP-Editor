@@ -1,0 +1,115 @@
+--- a/src/renderer/equation/mod.rs
++++ b/src/renderer/equation/mod.rs
+@@ -51,6 +51,20 @@
+     )
+ }
+ 
++/// [hwpedit 0011] 수식 기준선 위치(상자 높이에 대한 %, 수식 레코드의 baseline)를
++/// 수식 레이아웃에서 계산한다. 한글도 수식마다 다시 계산해 저장한다(한글 2022 재저장본:
++/// 근의 공식 71, 합 63, 2×2 행렬 67, α+β=π 86 — 85 로 저장한 파일도 한글은 자기 값으로
++/// 그리고 고쳐 저장). 85 고정은 그림(레이아웃 기준선)과 줄 기준선을 어긋나게 했다.
++pub fn intrinsic_baseline_pct(script: &str, font_size: u32) -> i16 {
++    let font_size_px = super::hwpunit_to_px(font_size.max(1) as i32, super::DEFAULT_DPI);
++    let ast = parser::EqParser::new(tokenizer::tokenize(script)).parse();
++    let layout = layout::EqLayout::new(font_size_px).layout(&ast);
++    if layout.height <= 0.0 {
++        return 85;
++    }
++    ((layout.baseline / layout.height) * 100.0).round().clamp(1.0, 100.0) as i16
++}
++
+ /// 수학 글꼴 HYhwpEQ에는 한글 cmap이 없으므로 한글은 본문 대체 글꼴로 그린다.
+ /// 보호된 크기와 한글 대체가 없는 수식은 저장 상자 계약을 유지한다.
+ /// 대체 경로는 폭·높이·기준선을 같은 AST에서 얻어 측정과 paint가 함께 소비한다.
+--- a/src/document_core/commands/object_ops/equation.rs
++++ b/src/document_core/commands/object_ops/equation.rs
+@@ -316,6 +316,11 @@
+             if !explicit_height {
+                 eq.common.height = height;
+             }
++            // [hwpedit 0011] 기준선도 새 모양에서 (봉지가 지정하지 않았을 때)
++            if json_i32(props_json, "baseline").is_none() {
++                eq.baseline =
++                    crate::renderer::equation::intrinsic_baseline_pct(&eq.script, eq.font_size);
++            }
+         }
+ 
+         // [#5890] raw 패스스루 무효화는 파괴가 아니라 판정으로 한다.
+@@ -591,7 +596,8 @@
+             script: script.to_string(),
+             font_size,
+             color,
+-            baseline: 85,
++            // [hwpedit 0011] 수식 모양에서 기준선을 계산(한글도 수식마다 계산)
++            baseline: crate::renderer::equation::intrinsic_baseline_pct(script, font_size),
+             version_info: "Equation Version 60".to_string(),
+             font_name: "HYhwpEQ".to_string(),
+             ..Default::default()
+@@ -761,7 +767,8 @@
+             script: script.to_string(),
+             font_size,
+             color,
+-            baseline: 85,
++            // [hwpedit 0011] 수식 모양에서 기준선을 계산(한글도 수식마다 계산)
++            baseline: crate::renderer::equation::intrinsic_baseline_pct(script, font_size),
+             version_info: "Equation Version 60".to_string(),
+             font_name: "HYhwpEQ".to_string(),
+             ..Default::default()
+--- a/src/renderer/composer/line_breaking.rs
++++ b/src/renderer/composer/line_breaking.rs
+@@ -4698,16 +4698,22 @@
+             let (_, height_hwp) = forced_inline_line.expect("checked inline control");
+             apply_inline_control_line_height(&mut text_seg, height_hwp);
+         }
+-        if let Some(height_hwp) = inline_controls
++        if let Some(tallest) = inline_controls
+             .iter()
+             .filter(|control| {
+                 (lb.start_idx..lb.end_idx).contains(&control.char_position)
+                     || (lb.end_idx == text_len && control.char_position == text_len)
+             })
+-            .map(|control| control.height_hwp)
+-            .max()
++            .max_by_key(|control| control.height_hwp)
+         {
+-            apply_inline_control_line_height(&mut text_seg, height_hwp);
++            // [hwpedit 0011] 줄 높이를 차지한 수식은 자기 기준선을 준다 — frame 경로
++            // (inline_owns_row_height)와 같은 규칙. 높이의 85% 로 두면 행렬처럼 기준선이
++            // 가운데인 수식이 그만큼 아래로 그려져 표 셀 밖으로 잘렸다.
++            let owns_row = tallest.height_hwp > text_seg.line_height;
++            apply_inline_control_line_height(&mut text_seg, tallest.height_hwp);
++            if let (true, Some(baseline)) = (owns_row, tallest.baseline_distance_hwp) {
++                text_seg.baseline_distance = baseline;
++            }
+         }
+         new_line_segs.push(text_seg);
+ 
+--- a/src/renderer/equation/symbols.rs
++++ b/src/renderer/equation/symbols.rs
+@@ -606,6 +606,16 @@
+         }
+     }
+ 
++    // [hwpedit 0011] 3차: 전부 대문자로 쓴 그리스 대문자 (GAMMA → Γ). 한글 2022 는
++    // `alpha + beta <= GAMMA` 의 GAMMA 를 Γ 로 그린다(f09 한글 PDF 실측).
++    if cmd.len() > 1 && cmd.chars().all(|c| c.is_ascii_uppercase()) {
++        let mut title = cmd.to_ascii_lowercase();
++        title[..1].make_ascii_uppercase();
++        if let Some(s) = GREEK_UPPER.get(title.as_str()) {
++            return Some(s);
++        }
++    }
++
+     None
+ }
+ 
+@@ -673,6 +683,9 @@
+     #[test]
+     fn test_greek_upper() {
+         assert_eq!(lookup_symbol("Gamma"), Some("Γ"));
++        assert_eq!(lookup_symbol("GAMMA"), Some("Γ"));
++        assert_eq!(lookup_symbol("OMEGA"), Some("Ω"));
++        assert_eq!(lookup_symbol("PI"), Some("Π"));
+         assert_eq!(lookup_symbol("Omega"), Some("Ω"));
+     }
+ 

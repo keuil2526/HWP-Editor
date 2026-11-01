@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- HWPX (OWPML) has no shared-mime-info entry; application/x-hwp (HWP 5) does. -->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/hwp+zip">
+    <comment>HWPX document</comment>
+    <comment xml:lang="ko">한글 HWPX 문서</comment>
+    <sub-class-of type="application/zip"/>
+    <alias type="application/vnd.hancom.hwpx"/>
+    <alias type="application/haansofthwpx"/>
+    <generic-icon name="x-office-document"/>
+    <magic priority="60">
+      <match type="string" value="mimetypeapplication/hwp+zip" offset="30"/>
+    </magic>
+    <glob pattern="*.hwpx"/>
+  </mime-type>
+</mime-info>

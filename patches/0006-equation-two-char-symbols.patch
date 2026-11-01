@@ -1,0 +1,42 @@
+diff --git a/src/renderer/equation/parser.rs b/src/renderer/equation/parser.rs
+index fd0e0a69..88b93929 100644
+--- a/src/renderer/equation/parser.rs
++++ b/src/renderer/equation/parser.rs
+@@ -236,6 +236,11 @@ impl EqParser {
+                 // -> 는 →로 변환
+                 if val == "->" {
+                     EqNode::MathSymbol("→".to_string())
++                } else if val.chars().count() > 1 {
++                    // [hwpedit] 두 글자 기호(+- <= >= != << >>)는 기호표의 글자로 그린다.
++                    // 종전에는 `+-` 등이 글자 그대로 찍혔다 (한글 2022는 ± ≤ … 로 그림).
++                    let sign = lookup_symbol(&val).map(str::to_owned);
++                    EqNode::Symbol(sign.unwrap_or(val))
+                 } else {
+                     EqNode::Symbol(val)
+                 }
+diff --git a/src/renderer/equation/symbols.rs b/src/renderer/equation/symbols.rs
+index 595ea2a5..7f562c32 100644
+--- a/src/renderer/equation/symbols.rs
++++ b/src/renderer/equation/symbols.rs
+@@ -134,6 +134,7 @@ static OPERATORS: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(
+         ("DIV", "÷"),
+         ("DIVDE", "÷"),
+         ("PLUSMINUS", "±"),
++        ("+-", "±"),
+         ("PM", "±"),
+         ("MINUSPLUS", "∓"),
+         ("MP", "∓"),
+diff --git a/src/renderer/equation/tokenizer.rs b/src/renderer/equation/tokenizer.rs
+index 93c7487f..fff13743 100644
+--- a/src/renderer/equation/tokenizer.rs
++++ b/src/renderer/equation/tokenizer.rs
+@@ -314,7 +314,8 @@ impl Tokenizer {
+ 
+         // 2문자 기호
+         let two: String = [ch, next].iter().collect();
+-        if matches!(two.as_str(), "<=" | ">=" | "!=" | "==" | "<<" | ">>") {
++        // [hwpedit] `+-` 는 한컴 수식의 ± (한글 2022 PDF로 확인: feature_lab f09)
++        if matches!(two.as_str(), "<=" | ">=" | "!=" | "==" | "<<" | ">>" | "+-") {
+             self.pos += 2;
+             return Some(Token::new(TokenType::Symbol, two, start));
+         }

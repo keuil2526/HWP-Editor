@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/engine", "crates/verify", "crates/app"]
+exclude = ["vendor"]
+
+[workspace.package]
+version = "0.9.16"
+edition = "2021"
+license = "MIT"

@@ -1,0 +1,79 @@
+--- a/src/document_core/commands/formatting.rs
++++ b/src/document_core/commands/formatting.rs
+@@ -1572,6 +1572,13 @@ impl DocumentCore {
+         let para = &mut self.document.sections[sec_idx].paragraphs[para_idx];
+         para.para_shape_id = new_id;
+         restamp_indentation(&mut para.line_segs, old_indent, new_indent);
++        // [hwpedit 0010] 문단 위·아래 간격만 바뀌어도 이 문단과 뒤 문단들의 저장 vpos 를
++        // 다시 이어야 한다. 레이아웃은 저장 vpos 를 우선하므로(height_cursor), 잇지 않으면
++        // 간격이 화면·재열기에 반영되지 않았다(줄 간격 160% 문단에 아래 6pt: 변화 없음).
++        let affects_vpos = para_shape_mods_affect_text_flow(&mods)
++            || mods.spacing_before.is_some()
++            || mods.spacing_after.is_some();
++        let stored_end_for_reset = crate::renderer::composer::paragraph_flow_end(para);
+ 
+         // 줄바꿈에 영향을 주는 변경 시 LineSeg 재계산 (compose는 LineSeg 값을 그대로
+         // 사용하므로). 줄간격뿐 아니라 여백/들여쓰기/줄나눔 단위도 사용 가능 폭·토큰
+@@ -1597,6 +1604,38 @@ impl DocumentCore {
+             );
+         }
+ 
++        if affects_vpos {
++            // [hwpedit 0010] 붙여넣기(foreign_paste)와 같은 방식으로 이 문단부터 다시 잇는다.
++            let styles = self.resolve_render_styles();
++            let doc_hwp3_layout = self.document.layout_profile().hwp3_layout();
++            // 구역 첫 문단은 앞 경계가 없어 위 간격이 이어지지 않는다. 한글은 첫 줄
++            // vpos 를 위 간격(HWPUNIT)으로 저장한다 — 한글 2022 재저장본 실측: 위 12pt
++            // 문단의 첫 줄 vpos 1200, 다음 문단 = 1200 + 1600 + 아래 600.
++            if para_idx == 0 {
++                let before = styles
++                    .para_styles
++                    .get(new_id as usize)
++                    .map_or(0.0, |st| st.spacing_before);
++                let want = (before * 7200.0 / self.dpi).round() as i32;
++                let segs = &mut self.document.sections[sec_idx].paragraphs[0].line_segs;
++                if let Some(first) = segs.first().map(|l| l.vertical_pos) {
++                    let delta = want - first;
++                    for l in segs.iter_mut() {
++                        l.vertical_pos += delta;
++                    }
++                }
++            }
++            crate::renderer::composer::recalculate_section_vpos(
++                &mut self.document.sections[sec_idx].paragraphs,
++                para_idx,
++                None,
++                stored_end_for_reset,
++                &styles,
++                self.dpi,
++                doc_hwp3_layout,
++            );
++        }
++
+         self.document.sections[sec_idx].raw_stream = None;
+         self.rebuild_section(sec_idx);
+         self.event_log.push(DocumentEvent::ParaFormatChanged {
+diff --git a/src/document_core/mod.rs b/src/document_core/mod.rs
+index c7f2d2c5..b771acd8 100644
+--- a/src/document_core/mod.rs
++++ b/src/document_core/mod.rs
+@@ -507,6 +507,19 @@ impl DocumentCore {
+         self.paginate();
+     }
+ 
++    /// [hwpedit 0010] 화면 표시 전용 부호: 문단 부호(↵)와 투명 선. 조판·저장에는 영향 없음
++    /// (쪽 그림 캐시는 이 값들을 지문(fingerprint)에 넣어 따로 보관한다).
++    pub fn set_view_marks_native(&mut self, paragraph_marks: bool, transparent_borders: bool) {
++        if (self.show_paragraph_marks, self.show_transparent_borders)
++            != (paragraph_marks, transparent_borders)
++        {
++            self.show_paragraph_marks = paragraph_marks;
++            self.show_transparent_borders = transparent_borders;
++            // 투명 선은 쪽 트리를 만들 때 레이아웃 엔진에 전달된다
++            self.invalidate_page_tree_cache();
++        }
++    }
++
+     /// 빈 문서를 생성한다 (테스트/미리보기용).
+     pub fn new_empty() -> Self {
+         DocumentCore {

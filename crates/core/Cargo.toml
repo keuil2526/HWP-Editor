@@ -1,0 +1,10 @@
+[package]
+name = "hwpedit-core"
+description = "File-integrity layer: format detection, backups, verified atomic saves"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[dev-dependencies]

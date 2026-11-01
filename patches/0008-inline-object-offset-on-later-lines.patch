@@ -1,0 +1,33 @@
+--- a/src/renderer/layout/paragraph_layout.rs
++++ b/src/renderer/layout/paragraph_layout.rs
+@@ -4961,6 +4961,18 @@ impl LayoutEngine {
+                 char_offset += 1;
+             }
+         }
++        // [hwpedit 0008] 앞 줄들에 있던 글자처럼 취급한 개체도 1칸씩 (위 run 가산과 같은 규칙)
++        if let (Some(p), Some(line)) = (para, composed.lines.get(start_line)) {
++            if start_line > 0 {
++                let at = p.control_text_positions();
++                char_offset += p
++                    .controls
++                    .iter()
++                    .zip(&at)
++                    .filter(|(c, &k)| c.is_treat_as_char_object() && k < line.char_start)
++                    .count();
++            }
++        }
+ 
+         // [Issue #926] Endnote 인라인 마커 — 첫 줄 앞에 일반 텍스트로 emit
+         // 한컴에서 미주 마커는 위첨자가 아닌 본문 크기 텍스트로 표시
+@@ -8893,7 +8905,10 @@ impl LayoutEngine {
+                 // x는 이미 sub-run 루프에서 갱신됨 (x += full_width 생략)
+             }
+ 
+-            char_offset += run_char_count;
++            // [hwpedit 0008] 글자처럼 취급한 개체(수식 등)는 문서 좌표에서 1칸을 차지한다.
++            // 위 하위 run 루프의 `sub_char_offset += 1` 이 다음 run·다음 줄로 이어지지
++            // 않아, 개체 뒤 줄의 TextRun.char_start 가 1씩 모자랐다(셀 캐럿·클릭이 한 칸 밀림).
++            char_offset += run_char_count + run_tacs.len();
+             run_char_pos = run_char_end;
+             inline_tab_cursor_render += run.text.chars().filter(|c| *c == '\t').count();
+             char_x_map.push((char_offset, x));

@@ -1,0 +1,179 @@
+--- a/src/renderer/equation/layout.rs
++++ b/src/renderer/equation/layout.rs
+@@ -555,11 +555,12 @@ impl EqLayout {
+         base_box.x = 0.0;
+         base_box.y = base_y;
+ 
++        let gap = italic_correction(&base_box, fs);
+         let mut sup_box = s;
+-        sup_box.x = base_box.width;
++        sup_box.x = base_box.width + gap;
+         sup_box.y = sup_y;
+ 
+-        let total_w = base_box.width + sup_box.width;
++        let total_w = sup_box.x + sup_box.width;
+ 
+         LayoutBox {
+             x: 0.0,
+@@ -692,16 +693,18 @@ impl EqLayout {
+         base_box.x = 0.0;
+         base_box.y = base_y;
+ 
++        let gap = italic_correction(&base_box, fs);
+         let mut sup_box = sp;
+-        sup_box.x = base_box.width;
++        sup_box.x = base_box.width + gap;
+         sup_box.y = 0.0;
+ 
++        // [hwpedit 0009] 아래첨자는 위첨자의 기준선(0.75) 아래에서 시작한다. sub_shift 만
++        // 쓰면 두 첨자 상자가 세로로 겹쳐 P_k^2 의 k 와 2 가 맞닿았다.
+         let mut sub_box = sb;
+         sub_box.x = base_box.width;
+-        sub_box.y = base_y + sub_shift;
++        sub_box.y = (base_y + sub_shift).max(sup_box.y + sup_box.height * 0.75);
+ 
+-        let script_w = sup_box.width.max(sub_box.width);
+-        let total_w = base_box.width + script_w;
++        let total_w = (sup_box.x + sup_box.width).max(sub_box.x + sub_box.width);
+ 
+         LayoutBox {
+             x: 0.0,
+@@ -1246,7 +1249,20 @@ pub(crate) fn is_integral_symbol(symbol: &str) -> bool {
+ /// 텍스트 폭 추정
+ pub(crate) fn estimate_text_width(text: &str, font_size: f64, italic: bool) -> f64 {
+     let mut w = 0.0;
++    let mut letters = 0.0;
+     for ch in text.chars() {
++        // [hwpedit 0009] 라틴 글자는 실제 글꼴 폭을 쓴다. 고정 비율(0.55/0.65)은 m·w·M·W
++        // 처럼 넓은 글자를 크게 줄여 잡아 뒤의 첨자·글자가 글리프 위에 겹쳤다.
++        if ch.is_ascii_alphabetic() {
++            let i = (ch as u8 - b'A') as usize;
++            let table = if italic {
++                &STIX_ITALIC_LETTERS
++            } else {
++                &STIX_REGULAR_LETTERS
++            };
++            letters += font_size * table[i];
++            continue;
++        }
+         let ratio = if ch.is_ascii() {
+             if ch.is_ascii_uppercase() {
+                 0.65
+@@ -1265,7 +1281,54 @@ pub(crate) fn estimate_text_width(text: &str, font_size: f64, italic: bool) -> f
+     if italic {
+         w *= 1.05;
+     }
+-    w
++    w + letters
++}
++
++// [hwpedit 0009] A..Z, [\]^_`, a..z 의 advance (em). 수식 글꼴 목록
++// ('Latin Modern Math', 'STIX Two Text', ...) 에서 처음 설치되어 실제로 쓰이는
++// STIX Two Text 의 hmtx 값. 사이의 6개 기호 자리는 쓰지 않는다.
++const STIX_REGULAR_LETTERS: [f64; 58] = [
++    0.718, 0.618, 0.67, 0.73, 0.626, 0.588, 0.72, 0.777, 0.357, 0.396, 0.702, 0.585, 0.895, 0.742,
++    0.737, 0.569, 0.737, 0.659, 0.504, 0.603, 0.752, 0.68, 0.944, 0.664, 0.647, 0.594, 0.0, 0.0,
++    0.0, 0.0, 0.0, 0.0, 0.48, 0.522, 0.446, 0.539, 0.464, 0.307, 0.484, 0.577, 0.285, 0.263, 0.542,
++    0.283, 0.852, 0.576, 0.514, 0.537, 0.521, 0.38, 0.395, 0.315, 0.57, 0.481, 0.749, 0.479, 0.483,
++    0.458,
++];
++const STIX_ITALIC_LETTERS: [f64; 58] = [
++    0.681, 0.593, 0.656, 0.702, 0.614, 0.583, 0.697, 0.757, 0.343, 0.398, 0.655, 0.569, 0.869,
++    0.714, 0.707, 0.569, 0.707, 0.62, 0.534, 0.61, 0.731, 0.64, 0.913, 0.637, 0.607, 0.606, 0.0,
++    0.0, 0.0, 0.0, 0.0, 0.0, 0.534, 0.495, 0.408, 0.541, 0.412, 0.291, 0.451, 0.549, 0.279, 0.272,
++    0.499, 0.273, 0.825, 0.564, 0.485, 0.521, 0.518, 0.383, 0.367, 0.298, 0.557, 0.429, 0.694,
++    0.453, 0.446, 0.425,
++];
++// 이탤릭 글리프가 advance 오른쪽으로 넘치는 양 (em, STIX Two Text Italic 의 xMax - advance).
++// 위첨자는 이만큼 띄워야 기울어진 대문자(M, W, V, T ...)나 f 의 윗부분에 가리지 않는다.
++const STIX_ITALIC_CORRECTION: [f64; 58] = [
++    0.0, 0.0, 0.018, 0.0, 0.016, 0.051, 0.0, 0.048, 0.052, 0.063, 0.062, 0.0, 0.045, 0.069, 0.0,
++    0.012, 0.0, 0.0, 0.005, 0.048, 0.071, 0.099, 0.097, 0.08, 0.108, 0.033, 0.0, 0.0, 0.0, 0.0,
++    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.146, 0.007, 0.0, 0.0, 0.0, 0.006, 0.0, 0.0, 0.0, 0.0, 0.0,
++    0.0, 0.033, 0.0, 0.02, 0.0, 0.0, 0.0, 0.027, 0.0, 0.004,
++];
++
++/// [hwpedit 0009] 이탤릭 글자로 끝나는 밑글자 뒤 위첨자의 간격.
++fn italic_correction(base: &LayoutBox, fs: f64) -> f64 {
++    let last = match &base.kind {
++        LayoutKind::Text(t) if !super::text_has_cjk(t) => t.chars().last(),
++        LayoutKind::Row(c) => return c.last().map_or(0.0, |b| italic_correction(b, fs)),
++        _ => None,
++    };
++    // 글리프 끝에 딱 붙지 않도록 넘치는 글자에는 0.05em 을 더 띄운다.
++    match last {
++        Some(ch) if ch.is_ascii_alphabetic() => {
++            let ic = STIX_ITALIC_CORRECTION[(ch as u8 - b'A') as usize];
++            if ic > 0.0 {
++                fs * (ic + 0.05)
++            } else {
++                0.0
++            }
++        }
++        _ => 0.0,
++    }
+ }
+ 
+ /// 비-ASCII 문자의 폭 비율 추정 (font_size 대비)
+@@ -1512,6 +1575,61 @@ mod tests {
+         );
+     }
+ 
++    /// [hwpedit 0009] 첨자는 밑글자의 실제 글리프 오른쪽 끝 뒤에 놓여야 한다.
++    /// 글리프 끝은 STIX Two Text Italic(수식 글꼴 목록에서 처음 설치된 글꼴)의 값.
++    #[test]
++    fn scripts_clear_the_base_glyph() {
++        let fs = 20.0;
++        let find = |lb: &LayoutBox| -> (f64, f64) {
++            let (base, script) = match &lb.kind {
++                LayoutKind::Subscript { base, sub } => (base, sub),
++                LayoutKind::Superscript { base, sup } => (base, sup),
++                LayoutKind::Row(c) if c.len() == 1 => return find_inner(&c[0]),
++                other => panic!("unexpected {other:?}"),
++            };
++            (base.x, script.x)
++        };
++        fn find_inner(lb: &LayoutBox) -> (f64, f64) {
++            match &lb.kind {
++                LayoutKind::Subscript { base, sub } => (base.x, sub.x),
++                LayoutKind::Superscript { base, sup } => (base.x, sup.x),
++                other => panic!("unexpected {other:?}"),
++            }
++        }
++        // 위·아래첨자를 함께 쓰면 아래첨자의 키 큰 글자 윗끝(기준선 위 0.7em)이 위첨자 기준선보다 아래
++        let lb = parse_and_layout("P_{k}^{2}", fs);
++        let node = match &lb.kind {
++            LayoutKind::Row(c) => &c[0],
++            _ => &lb,
++        };
++        let LayoutKind::SubSup { sub, sup, .. } = &node.kind else {
++            panic!("{:?}", node.kind)
++        };
++        assert!(
++            sub.y + sub.baseline - 0.7 * fs * SCRIPT_SCALE > sup.y + sup.baseline,
++            "P_k^2: sub top {:.2}, sup baseline {:.2}",
++            sub.y + sub.baseline - 0.7 * fs * SCRIPT_SCALE,
++            sup.y + sup.baseline
++        );
++        // (스크립트, 밑글자 글리프 오른쪽 끝 / em)
++        for (script, glyph_right) in [
++            ("m_i", 0.798),
++            ("m^2", 0.798),
++            ("M^2", 0.914),
++            ("W^2", 1.01),
++            ("V^n", 0.739),
++            ("f^2", 0.437),
++        ] {
++            let (base_x, script_x) = find(&parse_and_layout(script, fs));
++            assert!(
++                script_x - base_x >= glyph_right * fs - 0.01,
++                "{script}: script at {:.2}, base glyph ends at {:.2}",
++                script_x - base_x,
++                glyph_right * fs
++            );
++        }
++    }
++
+     #[test]
+     fn test_korean_text_width_not_italic() {
+         // 한글 텍스트는 이탤릭 보정 없이 폭 산출

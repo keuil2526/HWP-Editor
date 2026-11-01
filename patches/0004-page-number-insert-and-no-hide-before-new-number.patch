@@ -1,0 +1,119 @@
+diff --git a/src/document_core/commands/object_ops/common.rs b/src/document_core/commands/object_ops/common.rs
+index 9d15d48c..4b8d4322 100644
+--- a/src/document_core/commands/object_ops/common.rs
++++ b/src/document_core/commands/object_ops/common.rs
+@@ -464,4 +464,54 @@ impl crate::document_core::DocumentCore {
+             insert_idx
+         )))
+     }
++
++    /// [hwpedit] 쪽 번호 매기기: 쪽 번호 위치('pgnp') 컨트롤을 넣는다. 같은 문단에 이미
++    /// 있으면 그 컨트롤의 값만 바꾼다(한 문단에 둘을 쌓지 않음). 위치는 새 번호와 같은
++    /// 방식으로 `char_offset` 의 컨트롤 순서에 맞춘다 — 0 이면 구역/단 정의 뒤.
++    pub fn insert_page_number_pos_native(
++        &mut self,
++        section_idx: usize,
++        para_idx: usize,
++        char_offset: usize,
++        pnp: crate::model::control::PageNumberPos,
++    ) -> Result<String, crate::error::HwpError> {
++        use crate::error::HwpError;
++        use crate::model::control::Control;
++
++        let paragraph = self
++            .document
++            .sections
++            .get_mut(section_idx)
++            .ok_or_else(|| HwpError::RenderError(format!("구역 인덱스 {} 범위 초과", section_idx)))?
++            .paragraphs
++            .get_mut(para_idx)
++            .ok_or_else(|| HwpError::RenderError(format!("문단 인덱스 {} 범위 초과", para_idx)))?;
++        if let Some(existing) = paragraph.controls.iter_mut().find_map(|c| match c {
++            Control::PageNumberPos(p) => Some(p),
++            _ => None,
++        }) {
++            *existing = pnp;
++            self.document.sections[section_idx].raw_stream = None;
++        } else {
++            self.document.sections[section_idx].raw_stream = None;
++            let paragraph = &mut self.document.sections[section_idx].paragraphs[para_idx];
++            let insert_idx = {
++                let positions = crate::document_core::helpers::find_control_text_positions(paragraph);
++                positions.iter().position(|&pos| pos > char_offset).unwrap_or(paragraph.controls.len())
++            };
++            paragraph.align_ctrl_data_records();
++            paragraph.controls.insert(insert_idx, Control::PageNumberPos(pnp));
++            paragraph.ctrl_data_records.insert(insert_idx, None);
++            paragraph.shift_for_inline_control_insert(insert_idx, char_offset);
++            paragraph.char_count += 8;
++            paragraph.control_mask |= 1u32 << 0x0015;
++            paragraph.has_para_text = true;
++            self.shift_active_field_for_control_insert(section_idx, para_idx, insert_idx);
++            self.reflow_paragraph(section_idx, para_idx);
++        }
++        self.recompose_section(section_idx);
++        self.paginate_if_needed();
++        self.invalidate_page_tree_cache();
++        Ok(crate::document_core::helpers::json_ok())
++    }
+ }
+diff --git a/src/renderer/page_number.rs b/src/renderer/page_number.rs
+index 5c0165ab..7502f321 100644
+--- a/src/renderer/page_number.rs
++++ b/src/renderer/page_number.rs
+@@ -94,8 +94,15 @@ impl<'a> PageNumberAssigner<'a> {
+ 
+     /// NewNumber가 존재하지만 아직 발화되지 않은 상태인지 판별한다.
+     /// true이면 이 페이지에 쪽번호를 표시하지 않아야 한다 (한컴 호환).
++    ///
++    /// [hwpedit] 한글 2022 실측: 1쪽에 쪽 번호 위치, 2쪽에 새 번호(20)가 있는 문서를
++    /// PDF로 내면 1쪽에 "- 1 -"이 찍힌다 (hwpedit feature_lab f08, HWP·HWPX 모두).
++    /// task #634 보고서도 "NewNumber 게이팅은 한컴 동작이 아님"으로 결론 냈다
++    /// (aift 1·6쪽 표시). 그래서 새 번호 전 쪽을 감추지 않는다. aift 2·3쪽의 미표시는
++    /// 다른 원인(#637)이며 test_634 8건은 이 변경 뒤에도 통과한다.
+     pub fn should_hide_page_number(&self) -> bool {
+-        !self.new_page_numbers.is_empty() && !self.numbering_started
++        let _ = (self.new_page_numbers, self.numbering_started);
++        false
+     }
+ 
+     fn para_first_appears(page: &PageContent, target_pi: usize) -> bool {
+@@ -440,29 +447,22 @@ mod tests {
+         assert_eq!(a.assign(&p2), 2);
+     }
+ 
++    /// [hwpedit] 기대값 변경: 종전 "새 번호 전 쪽은 숨김"은 합성 입력의 기대값이었다.
++    /// 한글 2022는 새 번호(2쪽) 앞의 1쪽에도 쪽 번호를 찍는다 (hwpedit feature_lab f08
++    /// 의 한글 PDF "- 1 -", HWP·HWPX). task #634 보고서의 aift 1·6쪽 관측과도 같다.
+     #[test]
+-    fn should_hide_before_first_new_number() {
++    fn page_numbers_show_before_first_new_number() {
+         let nns = vec![(5usize, 1u16)];
+         let mut a = PageNumberAssigner::new(&nns, 1);
+-        assert!(
+-            a.should_hide_page_number(),
+-            "NewNumber 존재 + 미발화 → 숨김"
+-        );
++        assert!(!a.should_hide_page_number(), "새 번호 전에도 표시");
+ 
+         let p1 = mk_page(vec![PageItem::FullParagraph { para_index: 0 }]);
+-        a.assign(&p1);
+-        assert!(
+-            a.should_hide_page_number(),
+-            "아직 NewNumber 미트리거 → 숨김"
+-        );
++        assert_eq!(a.assign(&p1), 1);
++        assert!(!a.should_hide_page_number(), "새 번호 전 쪽 → 표시");
+ 
+         let p2 = mk_page(vec![PageItem::FullParagraph { para_index: 5 }]);
+-        a.assign(&p2);
+-        assert!(!a.should_hide_page_number(), "NewNumber 발화 후 → 표시");
+-
+-        let p3 = mk_page(vec![PageItem::FullParagraph { para_index: 6 }]);
+-        a.assign(&p3);
+-        assert!(!a.should_hide_page_number(), "이후에도 계속 표시");
++        assert_eq!(a.assign(&p2), 1, "새 번호 1로 다시 시작");
++        assert!(!a.should_hide_page_number(), "새 번호 뒤 → 표시");
+     }
+ 
+     #[test]

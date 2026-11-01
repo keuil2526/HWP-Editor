@@ -1,0 +1,23 @@
+diff --git a/src/document_core/commands/text_editing.rs b/src/document_core/commands/text_editing.rs
+index 9f6f809d..02ce0c7a 100644
+--- a/src/document_core/commands/text_editing.rs
++++ b/src/document_core/commands/text_editing.rs
+@@ -1429,6 +1429,18 @@ impl DocumentCore {
+         self.insert_text_at_caret_native(section_idx, para_idx, char_offset, false, text)
+     }
+ 
++    /// [hwpedit] `char_offset` 자리에 놓인 인라인 개체(수식·그림·각주 …) **뒤에** 글자를
++    /// 넣는다. 일반 [`Self::insert_text_native`] 는 같은 자리의 개체 앞에 넣는다.
++    pub fn insert_text_after_control_native(
++        &mut self,
++        section_idx: usize,
++        para_idx: usize,
++        char_offset: usize,
++        text: &str,
++    ) -> Result<String, HwpError> {
++        self.insert_text_at_caret_native(section_idx, para_idx, char_offset, true, text)
++    }
++
+     /// [#7444] `after_inline_control` 이면 `char_offset` 자리에 놓인 개체 뒤에 넣는다
+     /// ([`Paragraph::insert_text_at_caret`]).
+     pub(crate) fn insert_text_at_caret_native(

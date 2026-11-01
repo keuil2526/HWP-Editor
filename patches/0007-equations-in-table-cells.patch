@@ -1,0 +1,248 @@
+--- a/src/document_core/commands/object_ops/equation.rs	2026-10-31 15:26:16.389153127 +0900
++++ b/src/document_core/commands/object_ops/equation.rs	2026-10-31 15:26:16.534137654 +0900
+@@ -645,6 +645,165 @@
+             para_idx, insert_idx
+         ))
+     }
++
++    /// [hwpedit] 표 셀 문단의 `equation_idx` 번째 컨트롤(수식)의 속성을 바꾼다.
++    /// [`Self::set_equation_properties_native`] 의 셀 경로는 문단의 **첫** 수식만 고친다.
++    #[allow(clippy::too_many_arguments)]
++    pub fn set_cell_equation_properties_native(
++        &mut self,
++        section_idx: usize,
++        parent_para_idx: usize,
++        control_idx: usize,
++        cell_idx: usize,
++        cell_para_idx: usize,
++        equation_idx: usize,
++        props_json: &str,
++    ) -> Result<String, HwpError> {
++        let dpi = self.dpi;
++        let para =
++            self.get_cell_paragraph_mut(section_idx, parent_para_idx, control_idx, cell_idx, cell_para_idx)?;
++        let Some(Control::Equation(eq)) = para.controls.get_mut(equation_idx) else {
++            return Err(HwpError::RenderError("셀 문단의 그 자리에 수식이 없습니다".to_string()));
++        };
++        Self::apply_equation_properties(eq, dpi, props_json);
++        self.mark_cell_control_dirty(section_idx, parent_para_idx, control_idx);
++        self.reflow_cell_paragraph(section_idx, parent_para_idx, control_idx, cell_idx, cell_para_idx);
++        self.recalculate_cell_paragraph_vpos_native(
++            section_idx,
++            parent_para_idx,
++            control_idx,
++            cell_idx,
++            cell_para_idx,
++            None,
++        );
++        self.mark_table_text_reflowed_after_edit(section_idx, parent_para_idx, control_idx)?;
++        self.document.sections[section_idx].raw_stream = None;
++        self.mark_section_dirty(section_idx);
++        self.recompose_section(section_idx);
++        self.paginate_if_needed();
++        self.invalidate_page_tree_cache();
++        Ok(crate::document_core::helpers::json_ok())
++    }
++
++    /// [hwpedit] 표 셀 문단에 수식을 넣는다. 본문 수식([`Self::insert_equation_native`])과
++    /// 같은 수식 컨트롤(글자처럼 취급, 문단 기준)을 셀 문단의 `char_offset` 자리에 넣고,
++    /// 셀 글자 입력과 같은 순서로 셀을 다시 조판한다.
++    #[allow(clippy::too_many_arguments)]
++    pub fn insert_equation_in_cell_native(
++        &mut self,
++        section_idx: usize,
++        parent_para_idx: usize,
++        control_idx: usize,
++        cell_idx: usize,
++        cell_para_idx: usize,
++        char_offset: usize,
++        script: &str,
++        font_size: u32,
++        color: u32,
++    ) -> Result<String, HwpError> {
++        use crate::model::control::Equation;
++        use crate::model::shape::{CommonObjAttr, HorzRelTo, TextWrap, VertRelTo};
++        use crate::parser::tags::CTRL_EQUATION;
++
++        // 문서 안 수식 수(본문 + 표 셀): instance ID 순번과 z-order 에 쓴다.
++        let count_in = |paras: &[crate::model::paragraph::Paragraph]| -> usize {
++            paras
++                .iter()
++                .flat_map(|p| p.controls.iter())
++                .map(|c| match c {
++                    Control::Equation(_) => 1,
++                    Control::Table(t) => t
++                        .cells
++                        .iter()
++                        .flat_map(|cell| cell.paragraphs.iter())
++                        .flat_map(|p| p.controls.iter())
++                        .filter(|c| matches!(c, Control::Equation(_)))
++                        .count(),
++                    _ => 0,
++                })
++                .sum()
++        };
++        let in_section = self
++            .document
++            .sections
++            .get(section_idx)
++            .map(|s| count_in(&s.paragraphs))
++            .ok_or_else(|| HwpError::RenderError(format!("구역 인덱스 {} 범위 초과", section_idx)))?;
++        let in_document: usize = self.document.sections.iter().map(|s| count_in(&s.paragraphs)).sum();
++        let sequence = u32::try_from(in_document)
++            .ok()
++            .and_then(|order| order.checked_add(1))
++            .filter(|&order| order <= 0x03ff_ffff)
++            .ok_or_else(|| {
++                HwpError::RenderError("수식 instance ID를 더 이상 배정할 수 없습니다.".to_string())
++            })?;
++
++        let (width, height) = crate::renderer::equation::intrinsic_size_hwp(script, font_size);
++        let equation = Equation {
++            common: CommonObjAttr {
++                ctrl_id: CTRL_EQUATION,
++                // 본문 수식과 같은 인라인 수식 계약 (insert_equation_native 참고)
++                attr: 0x0C2A_2311,
++                treat_as_char: true,
++                width,
++                height,
++                z_order: in_section as i32,
++                margin: crate::model::Padding { left: 56, right: 56, top: 0, bottom: 0 },
++                instance_id: 0x4400_0000 | sequence,
++                flow_with_text: true,
++                vert_rel_to: VertRelTo::Para,
++                horz_rel_to: HorzRelTo::Para,
++                text_wrap: TextWrap::TopAndBottom,
++                hwp5_gen_shape_attr_bit26: true,
++                description: "수식입니다.".to_string(),
++                ..Default::default()
++            },
++            script: script.to_string(),
++            font_size,
++            color,
++            baseline: 85,
++            version_info: "Equation Version 60".to_string(),
++            font_name: "HYhwpEQ".to_string(),
++            ..Default::default()
++        };
++
++        self.document.sections[section_idx].raw_stream = None;
++        let paragraph =
++            self.get_cell_paragraph_mut(section_idx, parent_para_idx, control_idx, cell_idx, cell_para_idx)?;
++        let insert_idx = {
++            let positions = crate::document_core::helpers::find_control_text_positions(paragraph);
++            positions.iter().position(|&pos| pos > char_offset).unwrap_or(paragraph.controls.len())
++        };
++        paragraph.align_ctrl_data_records();
++        paragraph.controls.insert(insert_idx, Control::Equation(Box::new(equation)));
++        paragraph.ctrl_data_records.insert(insert_idx, None);
++        paragraph.shift_for_inline_control_insert(insert_idx, char_offset);
++        paragraph.char_count += 8;
++        paragraph.control_mask |= 1u32 << 11;
++        paragraph.has_para_text = true;
++
++        // 셀 글자 입력과 같은 순서: 부모 표 dirty → 셀 문단 조판 → 셀 vpos → 표 재조판 표시
++        self.mark_cell_control_dirty(section_idx, parent_para_idx, control_idx);
++        self.reflow_cell_paragraph(section_idx, parent_para_idx, control_idx, cell_idx, cell_para_idx);
++        self.recalculate_cell_paragraph_vpos_native(
++            section_idx,
++            parent_para_idx,
++            control_idx,
++            cell_idx,
++            cell_para_idx,
++            None,
++        );
++        self.mark_table_text_reflowed_after_edit(section_idx, parent_para_idx, control_idx)?;
++        self.mark_section_dirty(section_idx);
++        self.recompose_section(section_idx);
++        self.paginate_if_needed();
++        self.invalidate_page_tree_cache();
++
++        Ok(format!(
++            "{{\"ok\":true,\"paraIdx\":{},\"controlIdx\":{}}}",
++            parent_para_idx, insert_idx
++        ))
++    }
+ }
+ 
+ #[cfg(test)]
+--- a/src/document_core/commands/text_editing.rs	2026-10-31 15:26:16.521213839 +0900
++++ b/src/document_core/commands/text_editing.rs	2026-10-31 15:26:16.542227210 +0900
+@@ -1441,6 +1441,50 @@
+         self.insert_text_at_caret_native(section_idx, para_idx, char_offset, true, text)
+     }
+ 
++    /// [hwpedit] 표 셀 문단에서 `char_offset` 자리의 인라인 개체(수식 등) **뒤에** 글자를
++    /// 넣는다 ([`Self::insert_text_after_control_native`] 의 셀판). 개체 바로 뒤 첫 입력에만
++    /// 쓰며, 누름틀 경계 처리는 하지 않는다.
++    #[allow(clippy::too_many_arguments)]
++    pub fn insert_text_in_cell_after_control_native(
++        &mut self,
++        section_idx: usize,
++        parent_para_idx: usize,
++        control_idx: usize,
++        cell_idx: usize,
++        cell_para_idx: usize,
++        char_offset: usize,
++        text: &str,
++    ) -> Result<String, HwpError> {
++        let para =
++            self.get_cell_paragraph_mut(section_idx, parent_para_idx, control_idx, cell_idx, cell_para_idx)?;
++        para.insert_text_at_caret(char_offset, text, true);
++        self.document.sections[section_idx].raw_stream = None;
++        self.mark_cell_control_dirty(section_idx, parent_para_idx, control_idx);
++        self.reflow_cell_paragraph(section_idx, parent_para_idx, control_idx, cell_idx, cell_para_idx);
++        self.recalculate_cell_paragraph_vpos_native(
++            section_idx,
++            parent_para_idx,
++            control_idx,
++            cell_idx,
++            cell_para_idx,
++            None,
++        );
++        if matches!(
++            self.document.sections[section_idx].paragraphs[parent_para_idx].controls.get(control_idx),
++            Some(Control::Table(_))
++        ) {
++            self.mark_table_text_reflowed_after_edit(section_idx, parent_para_idx, control_idx)?;
++        }
++        self.mark_section_dirty(section_idx);
++        self.recompose_section(section_idx);
++        self.paginate_if_needed();
++        self.invalidate_page_tree_cache();
++        Ok(format!(
++            "{{\"ok\":true,\"charOffset\":{}}}",
++            char_offset + text.chars().count()
++        ))
++    }
++
+     /// [#7444] `after_inline_control` 이면 `char_offset` 자리에 놓인 개체 뒤에 넣는다
+     /// ([`Paragraph::insert_text_at_caret`]).
+     pub(crate) fn insert_text_at_caret_native(
+--- a/src/document_core/commands/object_ops/table.rs	2026-10-31 15:26:16.512161068 +0900
++++ b/src/document_core/commands/object_ops/table.rs	2026-10-31 15:26:16.550040366 +0900
+@@ -1456,6 +1456,24 @@
+         )
+     }
+ 
++    /// [hwpedit] 표 셀 안 **수식** 삭제 (cell_path 기반) — 그림·표 삭제와 같은 몸통.
++    pub fn delete_cell_equation_control_by_path_native(
++        &mut self,
++        section_idx: usize,
++        parent_para_idx: usize,
++        cell_path_json: &str,
++        inner_control_idx: usize,
++    ) -> Result<String, HwpError> {
++        self.delete_cell_control_by_path_native(
++            section_idx,
++            parent_para_idx,
++            cell_path_json,
++            inner_control_idx,
++            |c| matches!(c, Control::Equation(_)),
++            "수식이",
++        )
++    }
++
+     /// [#6771] 표 셀/글상자 **내부 표** 삭제 (cell_path 기반).
+     ///
+     /// 공공 양식은 작성 안내문을 셀 안 1×1 표(점선 상자)로 넣어 두고 본문에 "안내 박스는
