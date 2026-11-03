@@ -536,6 +536,26 @@ pub struct Document {
     /// Selection rectangles of whole paragraphs (keyed by the paragraph's start) for
     /// generation `.0`: a drag recomputes only the paragraphs at its two ends.
     sel_cache: std::cell::RefCell<(u64, std::collections::HashMap<Pos, Vec<SelRect>>)>,
+    /// The syllable being composed, put in the text so what follows moves as it will
+    /// (see [`Document::set_preedit`]); undone from a snapshot, never saved.
+    preedit: Option<Preedit>,
+}
+
+/// How [`Document::set_preedit`] puts the composed text in, matching how the
+/// committed text will go in.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PreeditAt {
+    Text,
+    /// Right after the inline object at the position (see `insert_text_after_object`).
+    AfterObject,
+    /// With formatting chosen before typing.
+    Formatted(CharFormat),
+}
+
+struct Preedit {
+    snapshot: u32,
+    gen: u64,
+    last_step: Option<Step>,
 }
 
 /// Serialized bytes that rhwp reported as complete (no content loss).
@@ -558,6 +578,7 @@ impl Document {
             last_step: None,
             removed: loss::Inventory::new(),
             sel_cache: Default::default(),
+            preedit: None,
         })
     }
 
@@ -576,6 +597,7 @@ impl Document {
             last_step: None,
             removed: loss::Inventory::new(),
             sel_cache: Default::default(),
+            preedit: None,
         })
     }
 
@@ -591,7 +613,69 @@ impl Document {
     /// True if the model differs from what is on disk. Undoing back to the
     /// saved state makes this false again, so an unchanged file is not rewritten.
     pub fn edited(&self) -> bool {
-        self.gen != self.saved_gen
+        self.preedit.as_ref().map_or(self.gen, |p| p.gen) != self.saved_gen
+    }
+
+    /// Show `text` (the IME syllable being composed, 예비 입력) at `pos` as if typed, so
+    /// the text after it and the line breaks move as Hwp shows them. Replaces the
+    /// previous composed text; empty `text` just removes it. Not an edit: no undo step,
+    /// [`Self::edited`] is unchanged, and it is taken out (from a snapshot) by
+    /// [`Self::cancel_preedit`], by the next edit, and before saving. Returns the
+    /// position after the composed text.
+    pub fn set_preedit(
+        &mut self,
+        pos: Pos,
+        at: &PreeditAt,
+        text: &str,
+    ) -> Result<Pos, EngineError> {
+        self.cancel_preedit();
+        let n = text.chars().count();
+        if n == 0 {
+            return Ok(pos);
+        }
+        let snapshot = self.core.save_snapshot_native();
+        let host = self.table_host(pos);
+        let r = Range {
+            start: pos,
+            end: pos.with_offset(pos.offset() + n),
+        };
+        let applied = match at {
+            PreeditAt::Text => insert_in(&mut self.core, pos, text).map(|_| ()),
+            PreeditAt::AfterObject => insert_after_object_in(&mut self.core, pos, text),
+            PreeditAt::Formatted(f) => insert_in(&mut self.core, pos, text)
+                .and_then(|_| apply_char_format_in(&mut self.core, r, &[0], f)),
+        };
+        if let Err(e) = applied {
+            let _ = self.core.restore_snapshot_native(snapshot);
+            self.core.discard_snapshot_native(snapshot);
+            return Err(e);
+        }
+        if host.is_some() && self.table_host(pos) == host {
+            self.sync_table_flow(pos);
+        }
+        self.preedit = Some(Preedit {
+            snapshot,
+            gen: self.gen,
+            last_step: self.last_step,
+        });
+        // a generation of its own, so position caches are not reused across it
+        self.gen = self.next_gen;
+        self.next_gen += 1;
+        Ok(r.end)
+    }
+
+    /// Take the composed text back out: the model is exactly as before `set_preedit`.
+    pub fn cancel_preedit(&mut self) {
+        if let Some(p) = self.preedit.take() {
+            let _ = self.core.restore_snapshot_native(p.snapshot);
+            self.core.discard_snapshot_native(p.snapshot);
+            self.gen = p.gen;
+            self.last_step = p.last_step;
+        }
+    }
+
+    pub fn has_preedit(&self) -> bool {
+        self.preedit.is_some()
     }
 
     /// Call after the serialized bytes reached disk: the file now matches the model.
@@ -642,6 +726,8 @@ impl Document {
         caret: Pos,
         f: impl FnOnce(&mut DocumentCore) -> Result<T, EngineError>,
     ) -> Result<T, EngineError> {
+        // an edit never builds on composed text that has not been committed
+        self.cancel_preedit();
         let coalesce = step != Step::Other && self.last_step == Some(step) && !self.undo.is_empty();
         if !coalesce {
             let snapshot = self.core.save_snapshot_native();
@@ -731,10 +817,12 @@ impl Document {
 
     /// Undo one step; returns where the caret was before that step.
     pub fn undo(&mut self, caret: Pos) -> Result<Option<Pos>, EngineError> {
+        self.cancel_preedit();
         self.swap_history(caret, true)
     }
 
     pub fn redo(&mut self, caret: Pos) -> Result<Option<Pos>, EngineError> {
+        self.cancel_preedit();
         self.swap_history(caret, false)
     }
 
@@ -1076,32 +1164,7 @@ impl Document {
         } else {
             Step::Other
         };
-        self.mutate(step, pos, |core| {
-            match pos {
-                Pos::Body {
-                    section,
-                    para,
-                    offset,
-                } => core.insert_text_after_control_native(section, para, offset, text),
-                Pos::Cell {
-                    section,
-                    parent_para,
-                    control,
-                    cell,
-                    cell_para,
-                    offset,
-                } => core.insert_text_in_cell_after_control_native(
-                    section,
-                    parent_para,
-                    control,
-                    cell,
-                    cell_para,
-                    offset,
-                    text,
-                ),
-            }
-            .map_err(err)
-        })?;
+        self.mutate(step, pos, |core| insert_after_object_in(core, pos, text))?;
         Ok(pos.with_offset(pos.offset() + text.chars().count()))
     }
 
@@ -4156,6 +4219,11 @@ impl Document {
 
     /// Serialize to `format`. Fails if rhwp reports any content loss.
     pub fn serialize(&self, format: Format) -> Result<Serialized, EngineError> {
+        if self.preedit.is_some() {
+            return Err(EngineError(
+                "조합 중인 글자가 있어 저장하지 않았습니다".into(),
+            ));
+        }
         let out = match format {
             Format::Hwp => self.core.export_hwp_with_adapter_snapshot_with_report(),
             Format::Hwpx => self.core.export_hwpx_native_with_report(),
@@ -4228,6 +4296,38 @@ impl Document {
             .flat_map(|s| s.paragraphs.iter().map(|p| p.text.clone()))
             .collect()
     }
+}
+
+fn insert_after_object_in(
+    core: &mut DocumentCore,
+    pos: Pos,
+    text: &str,
+) -> Result<(), EngineError> {
+    match pos {
+        Pos::Body {
+            section,
+            para,
+            offset,
+        } => core.insert_text_after_control_native(section, para, offset, text),
+        Pos::Cell {
+            section,
+            parent_para,
+            control,
+            cell,
+            cell_para,
+            offset,
+        } => core.insert_text_in_cell_after_control_native(
+            section,
+            parent_para,
+            control,
+            cell,
+            cell_para,
+            offset,
+            text,
+        ),
+    }
+    .map(|_| ())
+    .map_err(err)
 }
 
 fn insert_in(core: &mut DocumentCore, pos: Pos, text: &str) -> Result<String, EngineError> {

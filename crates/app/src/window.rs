@@ -9,6 +9,7 @@ use gtk::{cairo, gdk, gio, glib, graphene};
 use hwpedit_core::{save, save_new, Format, OpenedFile, SaveError, SaveOptions, SaveOutcome};
 use hwpedit_engine::{
     same_table, Align, CaretRect, CharFormat, Document, Hit, LineSpacingKind, ParaFormat, Pos,
+    PreeditAt,
     Range, Resize, SelRect,
 };
 use std::cell::{Cell, RefCell};
@@ -240,6 +241,11 @@ struct State {
     /// Text we put on the system clipboard when copying a table object.
     object_clip_text: Option<String>,
     preedit: String,
+    /// Where the composed text sits in the document while composing (start, end): it is
+    /// put in the text (Document::set_preedit) so what follows moves; `caret` stays at
+    /// the start. None when composing over a selection (drawn over the page instead).
+    preedit_span: Option<(Pos, Pos)>,
+    preedit_rects: Vec<SelRect>,
     zoom: f64,
     cache: HashMap<u32, CachedPage>,
     /// page -> (request id, svg hash, scale) of the raster being made in the background
@@ -1055,7 +1061,20 @@ impl Editor {
 
         if let Some(r) = st.caret_rect.filter(|r| r.page == page) {
             let (x, y, h) = (r.x * zoom, r.y * zoom, r.height.max(8.0) * zoom);
-            if !st.preedit.is_empty() {
+            if st.preedit_span.is_some() {
+                // the composed syllable is in the text: mark it as Hwp does
+                cr.set_source_rgba(1.0, 0.85, 0.2, 0.30);
+                for r in st.preedit_rects.iter().filter(|r| r.page == page) {
+                    cr.rectangle(r.x * zoom, r.y * zoom, r.w * zoom, r.h * zoom);
+                }
+                let _ = cr.fill();
+                cr.set_source_rgb(0.0, 0.0, 0.0);
+                for r in st.preedit_rects.iter().filter(|r| r.page == page) {
+                    cr.rectangle(r.x * zoom, (r.y + r.h) * zoom - 1.5, r.w * zoom, 1.5);
+                }
+                cr.rectangle(x.round() - 0.5, y, 1.5, h);
+                let _ = cr.fill();
+            } else if !st.preedit.is_empty() {
                 // the syllable being composed, in the face and size it will be typed in
                 let mut cs = st
                     .loaded
@@ -1286,6 +1305,8 @@ impl Editor {
     }
 
     fn on_press(&self, page: u32, x: f64, y: f64, extend: bool) {
+        // a click ends composing (the IME commits it), as in Hwp
+        self.finish_composition();
         let at_object = {
             let st = self.state.borrow();
             st.loaded
@@ -1777,6 +1798,109 @@ impl Editor {
                 self.scroll_to_caret();
             }
             Err(e) => self.toast(&format!("편집할 수 없습니다: {e}")),
+        }
+    }
+
+    /// The IME's syllable being composed (예비 입력) changed: put it in the document at
+    /// the caret so the text after it moves and lines rewrap as Hwp shows it, without
+    /// an undo step or a 수정됨 mark. Over a selection it is only drawn over the page.
+    fn show_preedit(self: &Rc<Self>, text: &str) {
+        self.state.borrow_mut().preedit = text.to_owned();
+        let target = {
+            let st = self.state.borrow();
+            let start = st.preedit_span.map(|s| s.0).or(st.caret);
+            match (start, self.selection()) {
+                (Some(p), None) => {
+                    let at = if st.after_object == Some(p) {
+                        PreeditAt::AfterObject
+                    } else if let Some(f) = st.pending.clone() {
+                        PreeditAt::Formatted(f)
+                    } else {
+                        PreeditAt::Text
+                    };
+                    Some((p, at))
+                }
+                _ => None,
+            }
+        };
+        let Some((start, at)) = target else {
+            let page = self.state.borrow().caret_rect.map(|r| r.page);
+            if let Some(a) = page.and_then(|p| self.areas.borrow().get(p as usize).cloned()) {
+                a.queue_draw();
+            }
+            return;
+        };
+        let result = {
+            let mut st = self.state.borrow_mut();
+            let Some(l) = st.loaded.as_mut() else { return };
+            let before = l.doc.page_count();
+            l.doc
+                .set_preedit(start, &at, text)
+                .map(|end| (end, before != l.doc.page_count()))
+        };
+        let (end, pages_changed) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                ime_log(format_args!("set_preedit failed: {e}"));
+                self.state.borrow_mut().preedit_span = None;
+                return;
+            }
+        };
+        self.after_model_change(pages_changed);
+        self.set_caret_keep_anchor(Some(start));
+        {
+            let mut st = self.state.borrow_mut();
+            let span = (!text.is_empty()).then_some((start, end));
+            st.preedit_span = span;
+            let (rect, rects) = match (&st.loaded, span) {
+                (Some(l), Some((a, b))) => (
+                    l.doc.caret_rect(b).ok(),
+                    Range::new(a, b).map_or(Vec::new(), |r| l.doc.selection_rects(r)),
+                ),
+                _ => (st.caret_rect, Vec::new()),
+            };
+            // the caret shows after the composed text
+            if rect.is_some() {
+                st.caret_rect = rect;
+            }
+            st.preedit_rects = rects;
+        }
+        if let Some(p) = self.state.borrow().caret_rect.map(|r| r.page) {
+            if let Some(a) = self.areas.borrow().get(p as usize) {
+                a.queue_draw();
+            }
+        }
+    }
+
+    /// End composing: the IME commits the syllable (the commit handler types it), and
+    /// anything still in the document provisionally is taken out.
+    fn finish_composition(&self) {
+        if self.state.borrow().preedit.is_empty() && self.state.borrow().preedit_span.is_none() {
+            return;
+        }
+        self.im.reset();
+        let had_span = {
+            let mut st = self.state.borrow_mut();
+            st.preedit.clear();
+            st.preedit_rects.clear();
+            let had = st.preedit_span.take().is_some();
+            if let Some(l) = st.loaded.as_mut() {
+                l.doc.cancel_preedit();
+            }
+            had
+        };
+        if had_span {
+            let mut st = self.state.borrow_mut();
+            st.model_gen += 1;
+            for c in st.cache.values_mut() {
+                c.stale = true;
+            }
+            drop(st);
+            let caret = self.state.borrow().caret;
+            self.set_caret_keep_anchor(caret);
+            for a in self.areas.borrow().iter() {
+                a.queue_draw();
+            }
         }
     }
 
@@ -2279,6 +2403,7 @@ impl Editor {
     }
 
     fn undo_redo(self: &Rc<Self>, undo: bool) {
+        self.finish_composition();
         let result = {
             let mut st = self.state.borrow_mut();
             let caret = st.caret.unwrap_or(Pos::Body {
@@ -2642,7 +2767,13 @@ impl Editor {
         self.im.connect_commit(move |_, text| {
             ime_log(format_args!("commit {text:?}"));
             if let Some(ed) = weak.upgrade() {
-                ed.state.borrow_mut().preedit.clear();
+                {
+                    // the next edit takes the composed text out of the document first
+                    let mut st = ed.state.borrow_mut();
+                    st.preedit.clear();
+                    st.preedit_span = None;
+                    st.preedit_rects.clear();
+                }
                 if ed.state.borrow().caret.is_some() {
                     ed.insert(text);
                 }
@@ -2653,11 +2784,7 @@ impl Editor {
             if let Some(ed) = weak.upgrade() {
                 let (s, _, _) = im.preedit_string();
                 ime_log(format_args!("preedit {s:?}"));
-                ed.state.borrow_mut().preedit = s.to_string();
-                let page = ed.state.borrow().caret_rect.map(|r| r.page);
-                if let Some(a) = page.and_then(|p| ed.areas.borrow().get(p as usize).cloned()) {
-                    a.queue_draw();
-                }
+                ed.show_preedit(s.as_str());
             }
         });
         let focus = gtk::EventControllerFocus::new();
@@ -3699,6 +3826,7 @@ impl Editor {
     }
 
     fn export_pdf(self: &Rc<Self>) {
+        self.finish_composition();
         let (name, dir) = self.default_name("pdf");
         let dialog = gtk::FileDialog::builder()
             .title("PDF로 내보내기")
@@ -3739,6 +3867,7 @@ impl Editor {
 
     /// Print through GTK: each page is rasterized at the printer's resolution.
     fn print(self: &Rc<Self>) {
+        self.finish_composition();
         let pages = self
             .state
             .borrow()
@@ -3814,6 +3943,7 @@ impl Editor {
 
     /// Save to the current path; `done(true)` after a successful save.
     pub fn save_in_place(self: &Rc<Self>, done: impl FnOnce(bool) + 'static) {
+        self.finish_composition();
         let path = {
             let st = self.state.borrow();
             let Some(l) = &st.loaded else {
@@ -3913,6 +4043,7 @@ impl Editor {
     /// the editor cannot remove on purpose would disappear (e.g. HWP memos, which
     /// rhwp does not model), ask before writing. Cancel is the default.
     fn save_to(self: &Rc<Self>, target: &Path) -> bool {
+        self.finish_composition();
         let check = {
             let st = self.state.borrow();
             let Some(l) = &st.loaded else { return false };

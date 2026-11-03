@@ -4,6 +4,6 @@ members = ["crates/core", "crates/engine", "crates/verify", "crates/app"]
 exclude = ["vendor"]
 
 [workspace.package]
-version = "0.9.19"
+version = "0.9.20"
 edition = "2021"
 license = "MIT"

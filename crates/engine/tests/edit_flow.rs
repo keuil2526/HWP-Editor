@@ -2253,3 +2253,58 @@ fn long_selections_are_drawn_whole_and_follow_edits() {
     let all = Range::new(START, Pos::Body { section: 0, para: 119, offset: d.para_len(starts[119]) }).unwrap();
     assert!(d.selection_rects(all).len() > 240);
 }
+
+use hwpedit_engine::PreeditAt;
+
+#[test]
+fn composed_syllable_moves_the_text_but_is_not_an_edit() {
+    let mut d = open(&blank());
+    let a = d.insert_text(START, "가나다").unwrap();
+    d.mark_saved();
+    let saved = d.serialize(Format::Hwp).unwrap().0;
+    let x_after = |d: &Document| d.caret_rect(a).unwrap().x;
+    let before = x_after(&d);
+    let at = START.with_offset(1); // between 가 and 나
+    let x_na = d.caret_rect(at).unwrap().x; // where 나 starts
+    // 예비 입력 'ㅎ' then '하': the text after the caret moves right by one syllable
+    let end = d.set_preedit(at, &PreeditAt::Text, "ㅎ").unwrap();
+    assert_eq!(end, START.with_offset(2));
+    let end = d.set_preedit(at, &PreeditAt::Text, "하").unwrap();
+    assert_eq!(d.body_text()[0], "가하나다");
+    assert!(d.caret_rect(end).unwrap().x > x_na + 5.0, "나 moved right");
+    assert!(d.has_preedit() && !d.edited(), "composing is not an edit");
+    assert!(d.serialize(Format::Hwp).is_err(), "never saved with composed text");
+    // cancel: the model is as before, byte for byte
+    d.cancel_preedit();
+    assert_eq!(d.body_text()[0], "가나다");
+    assert!(!d.edited());
+    assert_eq!(d.serialize(Format::Hwp).unwrap().0, saved);
+    assert!((x_after(&d) - before).abs() < 0.01);
+    // commit: the next edit takes the composed text out first, so it goes in once
+    d.set_preedit(at, &PreeditAt::Text, "한").unwrap();
+    let after = d.insert_text(at, "한").unwrap();
+    assert_eq!(d.body_text()[0], "가한나다");
+    assert!(d.edited() && !d.has_preedit());
+    // one undo step for the committed syllable, none for composing
+    d.undo(after).unwrap();
+    assert_eq!(d.body_text()[0], "가나다");
+    // a long syllable run wraps the line like typed text
+    let mut e = open(&blank());
+    let p = e.insert_text(START, &"가".repeat(30)).unwrap();
+    let line_y = e.caret_rect(p).unwrap().y;
+    assert_eq!(e.caret_rect(START).unwrap().y, line_y, "30 syllables fit on one line");
+    let end = e.set_preedit(p, &PreeditAt::Text, &"나".repeat(30)).unwrap();
+    assert!(e.caret_rect(end).unwrap().y > line_y, "composed text wraps to the next line");
+    e.cancel_preedit();
+    // in a table cell, and after an inline 수식
+    let t = e.create_table(p, 1, 1).unwrap();
+    let c = e.cell_at(t, 0, 0).unwrap();
+    let c2 = e.insert_text(c, "셀").unwrap();
+    e.set_preedit(c, &PreeditAt::Text, "ㄱ").unwrap();
+    assert_eq!(e.text_in(Range::new(c, c2.with_offset(2)).unwrap()).as_deref(), Some("ㄱ셀"));
+    e.cancel_preedit();
+    let eq = e.insert_equation(c2, "x^2").unwrap();
+    e.set_preedit(eq, &PreeditAt::AfterObject, "끝").unwrap();
+    e.cancel_preedit();
+    assert!(!e.has_preedit());
+}
