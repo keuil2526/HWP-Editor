@@ -1,0 +1,13 @@
+--- a/src/document_core/queries/cursor_nav.rs
++++ b/src/document_core/queries/cursor_nav.rs
+@@ -1753,7 +1753,9 @@ impl DocumentCore {
+     ///
+     /// cell_ctx: Some((ppi, ci, cei)) 면 셀 내부, None 이면 본문.
+     /// start/end_para_idx: 셀 내부일 때는 cellParaIndex.
+-    pub(crate) fn get_selection_rects_native(
++    /// [hwpedit 0012] 편집기가 줄 단위 선택 사각형을 쓰도록 공개(글자마다 캐럿을 묻던
++    /// 방식은 20쪽 선택에 75ms 걸렸고 4000자에서 잘렸다).
++    pub fn get_selection_rects_native(
+         &self,
+         section_idx: usize,
+         start_para_idx: usize,

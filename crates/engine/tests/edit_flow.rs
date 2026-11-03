@@ -2218,3 +2218,38 @@ fn formats_apply_to_every_cell_of_a_cell_block() {
     // not a block: two positions outside any table
     assert!(d.cell_block_ranges(START, START).is_err());
 }
+
+#[test]
+fn long_selections_are_drawn_whole_and_follow_edits() {
+    const LINE: &str = "가나다라마바사 아자차카타파하 문장을 길게 써서 줄이 두 줄로 넘어가도록 합니다. 가나다라마바사 아자차카타파하.";
+    let mut d = open(&blank());
+    let mut at = START;
+    let mut starts = Vec::new();
+    for i in 0..120 {
+        if i > 0 {
+            at = d.split_paragraph(at).unwrap();
+        }
+        starts.push(at);
+        at = d.insert_text(at, LINE).unwrap();
+    }
+    assert!(d.page_count() >= 5);
+    // 120 paragraphs x 2 lines, ~7000 characters: every line is highlighted (the old
+    // per-character walk stopped after 4000 characters)
+    let all = Range::new(START, at).unwrap();
+    let rects = d.selection_rects(all);
+    assert_eq!(rects.len(), 240, "one rectangle per line");
+    let pages: std::collections::BTreeSet<u32> = rects.iter().map(|r| r.page).collect();
+    assert_eq!(pages.len() as u32, d.page_count());
+    // the cached answer is the same as asking again, and a sub-range is its slice
+    assert_eq!(d.selection_rects(all), rects);
+    let part = Range::new(starts[10].with_offset(5), starts[20].with_offset(3)).unwrap();
+    let got = d.selection_rects(part);
+    assert_eq!(got.len(), 2 + 9 * 2 + 1);
+    assert_eq!(&got[2..20], &rects[22..40]);
+    // an edit that adds a line to paragraph 15 shows in the next answer
+    d.insert_text(starts[15].with_offset(10), LINE).unwrap();
+    let end = d.caret_rect(at).ok();
+    let _ = end;
+    let all = Range::new(START, Pos::Body { section: 0, para: 119, offset: d.para_len(starts[119]) }).unwrap();
+    assert!(d.selection_rects(all).len() > 240);
+}

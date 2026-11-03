@@ -29,7 +29,7 @@ fn err(e: impl std::fmt::Display) -> EngineError {
 }
 
 /// A caret position the engine can edit at.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Pos {
     Body {
         section: usize,
@@ -533,6 +533,9 @@ pub struct Document {
     /// Records/elements the user deleted on purpose since the last save (tables with
     /// their pictures...), so the save-time loss check does not report them.
     removed: loss::Inventory,
+    /// Selection rectangles of whole paragraphs (keyed by the paragraph's start) for
+    /// generation `.0`: a drag recomputes only the paragraphs at its two ends.
+    sel_cache: std::cell::RefCell<(u64, std::collections::HashMap<Pos, Vec<SelRect>>)>,
 }
 
 /// Serialized bytes that rhwp reported as complete (no content loss).
@@ -554,6 +557,7 @@ impl Document {
             saved_gen: 0,
             last_step: None,
             removed: loss::Inventory::new(),
+            sel_cache: Default::default(),
         })
     }
 
@@ -571,6 +575,7 @@ impl Document {
             saved_gen: 0,
             last_step: None,
             removed: loss::Inventory::new(),
+            sel_cache: Default::default(),
         })
     }
 
@@ -4015,6 +4020,98 @@ impl Document {
 
     /// Highlight rectangles for `r`, one per line run (caret rects grouped by line).
     pub fn selection_rects(&self, r: Range) -> Vec<SelRect> {
+        let (first, last) = (para_of(r.start), para_of(r.end));
+        if first == last {
+            return self.selection_rects_native(r);
+        }
+        let whole = |i: usize| {
+            let p = with_para(r.start, i).with_offset(0);
+            Range {
+                start: p,
+                end: p.with_offset(self.para_len(p)),
+            }
+        };
+        let mut out = self.selection_rects_native(Range {
+            start: r.start,
+            end: whole(first).end,
+        });
+        {
+            let mut cache = self.sel_cache.borrow_mut();
+            if cache.0 != self.gen {
+                *cache = (self.gen, std::collections::HashMap::new());
+            }
+            for i in first + 1..last {
+                let w = whole(i);
+                let rects = cache.1.entry(w.start).or_insert_with(|| {
+                    // caret queries keep the page's layout tree cached, which makes the
+                    // rectangle lookup ~40x cheaper than building the tree for it
+                    let _ = self.caret_rect(w.start);
+                    self.selection_rects_native(w)
+                });
+                out.extend_from_slice(rects);
+            }
+        }
+        out.extend(self.selection_rects_native(Range {
+            start: whole(last).start,
+            end: r.end,
+        }));
+        out
+    }
+
+    /// One call to rhwp's line-by-line selection rectangles; the per-character
+    /// fallback if rhwp cannot give them.
+    fn selection_rects_native(&self, r: Range) -> Vec<SelRect> {
+        // rhwp works line by line from the laid-out pages (patch 0012)
+        let (section, ctx) = match r.start {
+            Pos::Body { section, .. } => (section, None),
+            Pos::Cell {
+                section,
+                parent_para,
+                control,
+                cell,
+                ..
+            } => (section, Some((parent_para, control, cell))),
+        };
+        let native = self
+            .core
+            .get_selection_rects_native(
+                section,
+                para_of(r.start),
+                r.start.offset(),
+                para_of(r.end),
+                r.end.offset(),
+                ctx,
+                None,
+            )
+            .ok()
+            .and_then(|s| json(&s).ok())
+            .and_then(|v| {
+                v.as_array()?
+                    .iter()
+                    .map(|o| {
+                        let f = |k: &str| o.get(k).and_then(Value::as_f64);
+                        Some(SelRect {
+                            page: o.get("pageIndex")?.as_u64()? as u32,
+                            x: f("x")?,
+                            y: f("y")?,
+                            w: f("width")?,
+                            h: f("height")?,
+                        })
+                    })
+                    .collect::<Option<Vec<_>>>()
+            });
+        match native {
+            Some(mut rects) => {
+                rects.retain(|r| r.w > 0.0);
+                rects
+            }
+            None => self.selection_rects_by_caret(r),
+        }
+    }
+
+    /// Selection rectangles from the caret position of every character (the fallback
+    /// when rhwp cannot give them by line); stops after 4000 characters.
+    fn selection_rects_by_caret(&self, r: Range) -> Vec<SelRect> {
         const LIMIT: usize = 4000;
         let mut out: Vec<SelRect> = Vec::new();
         let mut budget = LIMIT;

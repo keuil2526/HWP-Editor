@@ -13,3 +13,5 @@ adw = { package = "libadwaita", version = "0.9", features = ["v1_6"] }
 resvg = "0.45"
 # memmap: share face data instead of re-reading font files on every text lookup
 fontdb = { version = "0.23", features = ["memmap"] }
+# already in the tree through fontdb; used to ask whether a face has Hangul glyphs
+ttf-parser = "0.25"

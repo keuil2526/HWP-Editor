@@ -954,7 +954,7 @@ dependencies = [
 
 [[package]]
 name = "hwpedit"
-version = "0.9.18"
+version = "0.9.19"
 dependencies = [
  "fontdb",
  "gtk4",
@@ -962,15 +962,16 @@ dependencies = [
  "hwpedit-engine",
  "libadwaita",
  "resvg",
+ "ttf-parser",
 ]
 
 [[package]]
 name = "hwpedit-core"
-version = "0.9.18"
+version = "0.9.19"
 
 [[package]]
 name = "hwpedit-engine"
-version = "0.9.18"
+version = "0.9.19"
 dependencies = [
  "cfb",
  "flate2",
@@ -982,7 +983,7 @@ dependencies = [
 
 [[package]]
 name = "hwpedit-verify"
-version = "0.9.18"
+version = "0.9.19"
 dependencies = [
  "hwpedit-core",
  "hwpedit-engine",

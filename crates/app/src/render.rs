@@ -38,6 +38,48 @@ fn installed_families() -> &'static HashSet<String> {
     })
 }
 
+/// The face to draw the syllable being composed (IME preedit) in: `name` when it is
+/// installed and has Hangul, else the serif face the page drawing falls back to.
+/// cairo's toy font API does not fall back per glyph, so a stand-in without Hangul
+/// (fontconfig gave Noto Sans for 함초롬바탕) drew the syllable as boxes.
+#[allow(dead_code)] // unused by the examples, which include this file
+pub fn preedit_family(name: &str) -> String {
+    static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(r) = cache.lock().unwrap().get(name) {
+        return r.clone();
+    }
+    let db = fontdb();
+    let has_hangul = db
+        .query(&usvg::fontdb::Query {
+            families: &[usvg::fontdb::Family::Name(name)],
+            ..Default::default()
+        })
+        .filter(|id| {
+            db.face(*id).is_some_and(|f| {
+                f.families
+                    .iter()
+                    .any(|(n, _)| n.eq_ignore_ascii_case(name))
+            })
+        })
+        .and_then(|id| {
+            db.with_face_data(id, |data, index| {
+                ttf_parser::Face::parse(data, index)
+                    .ok()
+                    .and_then(|f| f.glyph_index('가'))
+                    .is_some()
+            })
+        })
+        .unwrap_or(false);
+    let pick = if has_hangul {
+        name.to_owned()
+    } else {
+        "NanumMyeongjo".to_owned()
+    };
+    cache.lock().unwrap().insert(name.to_owned(), pick.clone());
+    pick
+}
+
 /// The first installed family of a CSS family list (or the generic it ends with).
 fn resolve_family(list: &str) -> String {
     static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
@@ -553,6 +595,12 @@ mod tests {
             r#"<svg><text x="1" y="2" font-style="italic" font-family="&apos;{family}&apos;">m</text></svg>"#
         );
         assert_eq!(synthesize_italics(&svg), svg);
+    }
+
+    #[test]
+    fn preedit_face_has_hangul() {
+        // a family that is not installed falls back to the serif face pages use
+        assert_eq!(preedit_family("No Such Font 함초롬"), "NanumMyeongjo");
     }
 
     #[test]

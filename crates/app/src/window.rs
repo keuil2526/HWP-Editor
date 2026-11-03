@@ -1070,7 +1070,7 @@ impl Editor {
                         (c.font, c.size_pt * 96.0 / 72.0 * zoom, c.bold)
                     });
                 cr.select_font_face(
-                    &font,
+                    &render::preedit_family(&font),
                     cairo::FontSlant::Normal,
                     if bold {
                         cairo::FontWeight::Bold
