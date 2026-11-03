@@ -277,6 +277,13 @@ pub struct Editor {
     settle: Cell<Option<glib::SourceId>>,
     /// 보기 options that outlive a document: 회색조, 문단 부호, 투명 선.
     view: Cell<view::ViewOptions>,
+    /// The panes floating over the top and bottom of the document view.
+    chrome: (gtk::Widget, gtk::Widget),
+    /// While a selection is being dragged: the page it started on and the pointer in
+    /// the scroller's coordinates, and the timer that scrolls when the pointer is held
+    /// past the top or bottom of the view.
+    drag_pointer: Cell<Option<(u32, f64, f64)>>,
+    autoscroll: Cell<Option<glib::SourceId>>,
     state: RefCell<State>,
 }
 
@@ -477,6 +484,9 @@ impl Editor {
             areas: RefCell::default(),
             settle: Cell::new(None),
             view: Cell::new(Default::default()),
+            chrome: (top.clone().upcast(), status_pane.clone().upcast()),
+            drag_pointer: Cell::new(None),
+            autoscroll: Cell::new(None),
             state: RefCell::new(State {
                 zoom: 1.0,
                 ..Default::default()
@@ -852,11 +862,13 @@ impl Editor {
                     ed.drag_border(page, dx, dy, false);
                 } else {
                     ed.on_drag(page, x + dx, y + dy);
+                    ed.track_drag_pointer(page, x + dx, y + dy);
                 }
             });
             let weak = Rc::downgrade(self);
             drag.connect_drag_end(move |_, dx, dy| {
                 if let Some(ed) = weak.upgrade() {
+                    ed.stop_autoscroll();
                     if ed.state.borrow().corner_drag.is_some() {
                         ed.drag_corner(page, dx, dy, true);
                     } else if ed.state.borrow().border_drag.is_some() {
@@ -1314,6 +1326,100 @@ impl Editor {
         let (page, x, y) = self.page_under(page, x, y);
         if let Some(Ok(Hit::Editable(pos))) = self.hit(page, x, y) {
             self.place(Some(pos), true);
+        }
+    }
+
+    /// Remember where the dragging pointer is, in the scroller's coordinates, and start
+    /// scrolling when it is past the top or bottom of the visible page area.
+    fn track_drag_pointer(self: &Rc<Self>, page: u32, x: f64, y: f64) {
+        let Some(area) = self.areas.borrow().get(page as usize).cloned() else {
+            return;
+        };
+        let Some(p) = area.compute_point(&self.scroller, &graphene::Point::new(x as f32, y as f32))
+        else {
+            return;
+        };
+        self.drag_pointer
+            .set(Some((page, p.x() as f64, p.y() as f64)));
+        if self.autoscroll_step_px() != 0.0 {
+            self.start_autoscroll();
+        }
+    }
+
+    /// Top and bottom of the document view not covered by the floating panes, in the
+    /// scroller's coordinates.
+    fn visible_band(&self) -> (f64, f64) {
+        let h = self.scroller.height() as f64;
+        let top = self
+            .chrome
+            .0
+            .compute_bounds(&self.scroller)
+            .map_or(0.0, |b| (b.y() + b.height()) as f64);
+        let bottom = self
+            .chrome
+            .1
+            .compute_bounds(&self.scroller)
+            .map_or(h, |b| b.y() as f64);
+        (top.clamp(0.0, h), bottom.clamp(0.0, h))
+    }
+
+    /// How far to scroll per tick for the current drag pointer: negative up, positive
+    /// down, 0 inside the view. Faster the further past the edge, as in Hwp.
+    fn autoscroll_step_px(&self) -> f64 {
+        let Some((_, _, y)) = self.drag_pointer.get() else {
+            return 0.0;
+        };
+        const EDGE: f64 = 24.0;
+        let (top, bottom) = self.visible_band();
+        let speed = |past: f64| (past * 0.5).clamp(4.0, 60.0);
+        if y < top + EDGE {
+            -speed(top + EDGE - y)
+        } else if y > bottom - EDGE {
+            speed(y - (bottom - EDGE))
+        } else {
+            0.0
+        }
+    }
+
+    fn start_autoscroll(self: &Rc<Self>) {
+        let running = self.autoscroll.take();
+        if running.is_some() {
+            self.autoscroll.set(running);
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        let id = glib::timeout_add_local(std::time::Duration::from_millis(30), move || {
+            let Some(ed) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            let step = ed.autoscroll_step_px();
+            let Some((page, sx, sy)) = ed.drag_pointer.get().filter(|_| step != 0.0) else {
+                ed.autoscroll.set(None);
+                return glib::ControlFlow::Break;
+            };
+            let adj = ed.scroller.vadjustment();
+            let before = adj.value();
+            adj.set_value((before + step).clamp(adj.lower(), adj.upper() - adj.page_size()));
+            if adj.value() == before {
+                return glib::ControlFlow::Continue; // at the top or the end
+            }
+            // the pointer has not moved on screen, but the pages have under it
+            let area = ed.areas.borrow().get(page as usize).cloned();
+            if let Some(p) = area.and_then(|a| {
+                ed.scroller
+                    .compute_point(&a, &graphene::Point::new(sx as f32, sy as f32))
+            }) {
+                ed.on_drag(page, p.x() as f64, p.y() as f64);
+            }
+            glib::ControlFlow::Continue
+        });
+        self.autoscroll.set(Some(id));
+    }
+
+    fn stop_autoscroll(&self) {
+        self.drag_pointer.set(None);
+        if let Some(id) = self.autoscroll.take() {
+            id.remove();
         }
     }
 
