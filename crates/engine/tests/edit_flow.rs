@@ -2165,3 +2165,56 @@ fn tall_equations_stay_inside_their_table_cell() {
         );
     }
 }
+
+#[test]
+fn formats_apply_to_every_cell_of_a_cell_block() {
+    let mut d = open(&blank());
+    let t = d.create_table(START, 2, 2).unwrap();
+    let cell = |d: &Document, r, c| d.cell_at(t, r, c).unwrap();
+    for (r, c) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+        let at = cell(&d, r, c);
+        d.insert_text(at, "가나").unwrap();
+    }
+    // block from the top left to the bottom right cell, as a drag would make it
+    let ranges = d.cell_block_ranges(cell(&d, 0, 0), cell(&d, 1, 1).with_offset(1)).unwrap();
+    assert_eq!(ranges.len(), 4);
+    d.apply_char_format_ranges(
+        &ranges,
+        &CharFormat {
+            bold: Some(true),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    d.set_align_ranges(&ranges, Align::Center).unwrap();
+    for (r, c) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+        let at = cell(&d, r, c).with_offset(2);
+        assert!(d.char_state(at).unwrap().bold, "cell {r},{c} bold");
+        assert_eq!(d.align_at(at), Some(Align::Center), "cell {r},{c} centred");
+    }
+    // a block of one column leaves the other column alone
+    let col = d.cell_block_ranges(cell(&d, 0, 1), cell(&d, 1, 1)).unwrap();
+    assert_eq!(col.len(), 2);
+    d.set_para_format_ranges(
+        &col,
+        &ParaFormat {
+            margin_left_pt: Some(10.0),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!((d.para_state(cell(&d, 1, 1)).unwrap().margin_left_pt - 10.0).abs() < 0.01);
+    assert!(d.para_state(cell(&d, 1, 0)).unwrap().margin_left_pt.abs() < 0.01);
+    // each call is one undo step
+    let at = cell(&d, 1, 1);
+    d.undo(at).unwrap();
+    d.undo(at).unwrap();
+    assert_eq!(d.align_at(cell(&d, 0, 0)), Some(Align::Justify));
+    assert!(d.char_state(cell(&d, 1, 1).with_offset(2)).unwrap().bold);
+    d.undo(at).unwrap();
+    for (r, c) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+        assert!(!d.char_state(cell(&d, r, c).with_offset(2)).unwrap().bold);
+    }
+    // not a block: two positions outside any table
+    assert!(d.cell_block_ranges(START, START).is_err());
+}

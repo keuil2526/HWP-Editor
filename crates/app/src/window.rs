@@ -1304,13 +1304,45 @@ impl Editor {
         }
     }
 
+    /// Extend the selection to the pointer. (`x`, `y`) are in the coordinates of the page
+    /// the drag started on; once the pointer is over another page (or the gap between
+    /// pages), the point is taken on that page, so a selection can run across pages.
     fn on_drag(&self, page: u32, x: f64, y: f64) {
         if self.state.borrow().caret.is_none() {
             return;
         }
+        let (page, x, y) = self.page_under(page, x, y);
         if let Some(Ok(Hit::Editable(pos))) = self.hit(page, x, y) {
             self.place(Some(pos), true);
         }
+    }
+
+    /// The page under a point given in page `from`'s coordinates, and the point in that
+    /// page's coordinates. Between pages: the nearer page, with y clamped onto it.
+    fn page_under(&self, from: u32, x: f64, y: f64) -> (u32, f64, f64) {
+        let areas = self.areas.borrow();
+        let Some(origin) = areas.get(from as usize) else {
+            return (from, x, y);
+        };
+        let mut best: Option<(f64, u32, f64, f64)> = None;
+        for (i, a) in areas.iter().enumerate() {
+            let Some(p) = origin.compute_point(a, &gtk::graphene::Point::new(x as f32, y as f32))
+            else {
+                continue;
+            };
+            let (px, py, h) = (p.x() as f64, p.y() as f64, a.height() as f64);
+            let dist = if py < 0.0 {
+                -py
+            } else if py > h {
+                py - h
+            } else {
+                0.0
+            };
+            if best.is_none_or(|b| dist < b.0) {
+                best = Some((dist, i as u32, px, py.clamp(0.0, (h - 1.0).max(0.0))));
+            }
+        }
+        best.map_or((from, x, y), |(_, p, px, py)| (p, px, py))
     }
 
     /// Non-empty selection, if any.
@@ -1699,7 +1731,29 @@ impl Editor {
     }
 
     /// Apply character formatting to the selection.
+    /// The cells of a 셀 블록 (anchor and caret in different cells of one table), each as
+    /// a range over its whole text. Hwp formats every selected cell, not just one.
+    fn cell_block_ranges(&self) -> Option<Vec<Range>> {
+        let st = self.state.borrow();
+        let (a, p) = (st.anchor?, st.caret?);
+        if Range::new(a, p).is_some() || !same_table(a, p) {
+            return None;
+        }
+        st.loaded.as_ref()?.doc.cell_block_ranges(a, p).ok()
+    }
+
     fn apply_format(self: &Rc<Self>, fmt: CharFormat) {
+        if let Some(cells) = self.cell_block_ranges() {
+            let result = {
+                let mut st = self.state.borrow_mut();
+                let Some(l) = st.loaded.as_mut() else { return };
+                let before = l.doc.page_count();
+                l.doc
+                    .apply_char_format_ranges(&cells, &fmt)
+                    .map(|_| before != l.doc.page_count())
+            };
+            return self.finish_format(result);
+        }
         let Some(sel) = self.selection() else {
             // no selection: remember it for the next typed text, like Hancom
             {
@@ -1732,8 +1786,15 @@ impl Editor {
         Some(Range::new(st.anchor.unwrap_or(p), p).unwrap_or(Range { start: p, end: p }))
     }
 
+    /// Paragraph ranges a paragraph format applies to: every cell of a 셀 블록, else
+    /// the paragraphs touched by the selection or the caret's paragraph.
+    fn para_targets(&self) -> Option<Vec<Range>> {
+        self.cell_block_ranges()
+            .or_else(|| self.para_range().map(|r| vec![r]))
+    }
+
     fn apply_align(self: &Rc<Self>, align: Align) {
-        let Some(range) = self.para_range() else {
+        let Some(ranges) = self.para_targets() else {
             return;
         };
         let result = {
@@ -1741,14 +1802,14 @@ impl Editor {
             let Some(l) = st.loaded.as_mut() else { return };
             let before = l.doc.page_count();
             l.doc
-                .set_align(range, align)
+                .set_align_ranges(&ranges, align)
                 .map(|_| before != l.doc.page_count())
         };
         self.finish_format(result);
     }
 
     fn apply_para(self: &Rc<Self>, fmt: ParaFormat) {
-        let Some(range) = self.para_range() else {
+        let Some(ranges) = self.para_targets() else {
             return;
         };
         let result = {
@@ -1756,7 +1817,7 @@ impl Editor {
             let Some(l) = st.loaded.as_mut() else { return };
             let before = l.doc.page_count();
             l.doc
-                .set_para_format(range, &fmt)
+                .set_para_format_ranges(&ranges, &fmt)
                 .map(|_| before != l.doc.page_count())
         };
         self.finish_format(result);

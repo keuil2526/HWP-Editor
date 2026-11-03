@@ -1388,13 +1388,56 @@ impl Document {
 
     /// Apply character properties to every paragraph slice in `r` as one undo step.
     pub fn apply_char_format(&mut self, r: Range, fmt: &CharFormat) -> Result<(), EngineError> {
-        if r.is_empty() {
+        self.apply_char_format_ranges(&[r], fmt)
+    }
+
+    /// [`Self::apply_char_format`] on several ranges (the cells of a 셀 블록) as one undo step.
+    pub fn apply_char_format_ranges(
+        &mut self,
+        rs: &[Range],
+        fmt: &CharFormat,
+    ) -> Result<(), EngineError> {
+        let rs: Vec<(Range, Vec<usize>)> = rs
+            .iter()
+            .filter(|r| !r.is_empty())
+            .map(|r| (*r, self.para_lens(*r)))
+            .collect();
+        let Some(end) = rs.last().map(|(r, _)| r.end) else {
             return Ok(());
-        }
-        let lens = self.para_lens(r);
-        self.mutate(Step::Other, r.end, |core| {
-            apply_char_format_in(core, r, &lens, fmt)
+        };
+        self.mutate(Step::Other, end, |core| {
+            rs.iter()
+                .try_for_each(|(r, lens)| apply_char_format_in(core, *r, lens, fmt))
         })
+    }
+
+    /// Each cell of the 셀 블록 spanned by `a` and `b` as a range over its whole text,
+    /// in the table's cell order — what Hwp formats when cells are selected.
+    pub fn cell_block_ranges(&self, a: Pos, b: Pos) -> Result<Vec<Range>, EngineError> {
+        let Pos::Cell {
+            section,
+            parent_para,
+            control,
+            ..
+        } = a
+        else {
+            return Err(EngineError("표 셀을 고르세요".into()));
+        };
+        Ok(self
+            .cell_block(a, b)?
+            .into_iter()
+            .map(|(cell, _)| {
+                let at = Pos::Cell {
+                    section,
+                    parent_para,
+                    control,
+                    cell,
+                    cell_para: 0,
+                    offset: 0,
+                };
+                self.container_range(at)
+            })
+            .collect())
     }
 
     /// Insert `text` with `fmt` applied to it (formatting chosen before typing).
@@ -1469,34 +1512,30 @@ impl Document {
 
     /// Set paragraph alignment for every paragraph touched by `r`.
     pub fn set_align(&mut self, r: Range, align: Align) -> Result<(), EngineError> {
+        self.set_align_ranges(&[r], align)
+    }
+
+    /// [`Self::set_align`] on several ranges (the cells of a 셀 블록) as one undo step.
+    pub fn set_align_ranges(&mut self, rs: &[Range], align: Align) -> Result<(), EngineError> {
+        let Some(last) = rs.last() else { return Ok(()) };
         let props = format!("{{\"alignment\":\"{}\"}}", align.key());
-        self.mutate(Step::Other, r.end, |core| {
-            for i in para_of(r.start)..=para_of(r.end) {
-                match r.start {
-                    Pos::Body { section, .. } => core.apply_para_format_native(section, i, &props),
-                    Pos::Cell {
-                        section,
-                        parent_para,
-                        control,
-                        cell,
-                        ..
-                    } => core.apply_para_format_in_cell_native(
-                        section,
-                        parent_para,
-                        control,
-                        cell,
-                        i,
-                        &props,
-                    ),
-                }
-                .map_err(err)?;
-            }
-            Ok(())
+        self.mutate(Step::Other, last.end, |core| {
+            rs.iter().try_for_each(|r| para_props_in(core, *r, &props))
         })
     }
 
     /// Apply paragraph properties to every paragraph touched by `r`.
     pub fn set_para_format(&mut self, r: Range, fmt: &ParaFormat) -> Result<(), EngineError> {
+        self.set_para_format_ranges(&[r], fmt)
+    }
+
+    /// [`Self::set_para_format`] on several ranges (the cells of a 셀 블록) as one undo step.
+    pub fn set_para_format_ranges(
+        &mut self,
+        rs: &[Range],
+        fmt: &ParaFormat,
+    ) -> Result<(), EngineError> {
+        let Some(&r) = rs.last() else { return Ok(()) };
         let mut props = serde_json::Map::new();
         let len = |pt: f64| Value::from((pt * PARA_UNITS_PER_PT).round() as i64);
         match (fmt.line_spacing, fmt.line_spacing_pct) {
@@ -1545,27 +1584,7 @@ impl Document {
         }
         let props = Value::Object(props).to_string();
         self.mutate(Step::Other, r.end, |core| {
-            for i in para_of(r.start)..=para_of(r.end) {
-                match r.start {
-                    Pos::Body { section, .. } => core.apply_para_format_native(section, i, &props),
-                    Pos::Cell {
-                        section,
-                        parent_para,
-                        control,
-                        cell,
-                        ..
-                    } => core.apply_para_format_in_cell_native(
-                        section,
-                        parent_para,
-                        control,
-                        cell,
-                        i,
-                        &props,
-                    ),
-                }
-                .map_err(err)?;
-            }
-            Ok(())
+            rs.iter().try_for_each(|r| para_props_in(core, *r, &props))
         })
     }
 
@@ -4309,6 +4328,31 @@ fn apply_style_at(
     }
     .map_err(err)?;
     sync_head_tag(core, at, i);
+    Ok(())
+}
+
+/// Apply rhwp paragraph properties (JSON) to every paragraph touched by `r`.
+fn para_props_in(core: &mut DocumentCore, r: Range, props: &str) -> Result<(), EngineError> {
+    for i in para_of(r.start)..=para_of(r.end) {
+        match r.start {
+            Pos::Body { section, .. } => core.apply_para_format_native(section, i, props),
+            Pos::Cell {
+                section,
+                parent_para,
+                control,
+                cell,
+                ..
+            } => core.apply_para_format_in_cell_native(
+                section,
+                parent_para,
+                control,
+                cell,
+                i,
+                props,
+            ),
+        }
+        .map_err(err)?;
+    }
     Ok(())
 }
 
